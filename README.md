@@ -85,6 +85,38 @@ apps/web/            Next.js 前端（/intelligence 情报流、/sources 来源�
 - **合规优先**：媒体源只存标题、摘要、原文链接（`rights_mode=metadata_excerpt`），全文不入库。
 - **失败不放大**：单个源采集失败只影响自己，指数退避重试并遵守 `Retry-After`，4xx 不重试。
 
+## 环境排障：WSL 里 docker 报 `Exec format error`
+
+现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
+
+两个独立根因，可能同时存在：
+
+**1. WSLInterop 未注册**
+WSL 执行 Windows `.exe` 依赖 `binfmt_misc` 里的 `WSLInterop` 条目，缺失时任何 `.exe` 都会报 `Exec format error`。
+
+```bash
+ls /proc/sys/fs/binfmt_misc/          # 只有 register、status 就是丢了
+cat /proc/sys/fs/binfmt_misc/WSLInterop
+```
+
+修复（临时生效，重启 WSL 会重新注册）：
+
+```bash
+sudo sh -c 'echo ":WSLInterop:M::MZ::/init:PF" > /proc/sys/fs/binfmt_misc/register'
+cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
+```
+
+回滚：`echo -1 | sudo tee /proc/sys/fs/binfmt_misc/WSLInterop`
+
+**2. Docker Desktop 的 CLI 注入不全**
+`/usr/bin/docker` 是指向 `/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker` 的符号链接；若 `cli-tools` 节点没挂上，链接就是悬空的。修复：Windows 侧 `wsl --shutdown`，等 8 秒后重开 Ubuntu 终端，让 Docker Desktop 重新注入。
+
+**应急通道**
+容器已在运行时不需要修 docker 客户端：
+
+- `make up` 会检测 5432 / 6379 是否已监听，已在跑就跳过启动
+- `make migrate` / `seed` / `sync` / `status` / `api` 完全不依赖 docker 客户端
+
 ## 已知边界（后续阶段处理）
 
 - 主题分类目前是确定性关键词规则，存在少量误判（如"标准版"命中政策类）；阶段 5 引入模型分类与人工校正。

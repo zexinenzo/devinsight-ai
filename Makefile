@@ -5,20 +5,34 @@ PY := .venv/bin/python
 API := apps/api
 WEB := apps/web
 
-.PHONY: help up down logs wait-db migrate seed sync status docs api worker beat web test lint fmt
+.PHONY: help check-docker up down logs wait-db migrate seed sync status docs api worker beat web test lint fmt
 
 help: ## 显示可用命令
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-up: ## 启动 Postgres(pgvector) 与 Redis
-	docker compose up -d
-	docker compose ps
+check-docker: ## 确认 Docker 客户端可用（内部使用）
+	@docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || { \
+		echo "✗ 连不上 Docker 引擎：docker 客户端不可用"; \
+		echo "  WSL 下最常见原因是 WSLInterop 未注册，见 README「Docker 客户端故障排查」"; \
+		exit 1; \
+	}
 
-down: ## 停止容器（保留数据卷）
+up: ## 启动 Postgres(pgvector) 与 Redis（已在运行则自动跳过）
+	@if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then \
+		docker compose up -d && docker compose ps; \
+	elif (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/6379) 2>/dev/null; then \
+		echo "✓ 5432 / 6379 已在监听，容器已运行，跳过启动"; \
+	else \
+		echo "✗ Docker 客户端不可用，且 5432 / 6379 都没有监听"; \
+		echo "  容器没起来就无法继续，先修 docker 客户端：见 README「Docker 客户端故障排查」"; \
+		exit 1; \
+	fi
+
+down: check-docker ## 停止容器（保留数据卷）
 	docker compose down
 
-logs: ## 跟踪数据库与 Redis 日志
+logs: check-docker ## 跟踪数据库与 Redis 日志
 	docker compose logs -f db redis
 
 migrate: ## 执行数据库迁移到最新版本
