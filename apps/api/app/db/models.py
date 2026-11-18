@@ -76,6 +76,10 @@ class Source(Base):
     last_http_status: Mapped[int | None] = mapped_column(Integer)
     health_status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'unknown'"))
     parser_version: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'rss-v1'"))
+    # 增量游标：由各 Connector 自定义结构（如 HN 的 {"max_item_id": 123}）。
+    # 用 JSONB 而非独立列，是因为不同来源的游标形态差异大，且它只是优化项——
+    # 丢了顶多退化成全量拉取，唯一约束仍保证不重复入库。
+    sync_cursor: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

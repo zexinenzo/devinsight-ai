@@ -41,6 +41,21 @@ class UpstreamError(AppError):
     code = "upstream_unavailable"
 
 
+class RateLimitedError(UpstreamError):
+    """上游限流（429，或 GitHub 额度耗尽返回的 403）。
+
+    与普通故障分开，因为二者的处理方式相反：
+    限流说明源是健康的，只是此刻不该再抓——继续重试只会让封禁时间更长。
+    采集服务据此只记 degraded，不累加 consecutive_failures，避免把好源打成 failing。
+    """
+
+    code = "upstream_rate_limited"
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 

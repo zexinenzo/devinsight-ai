@@ -14,11 +14,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import unicodedata
 from datetime import timezone
 
 from app.core.logging import configure_logging
 from app.db.session import dispose_engine, session_scope
 from app.services import document_service, ingestion_service, source_service
+
+
+def _display_width(text: str) -> int:
+    """终端显示宽度：CJK 全角字符占两列。
+
+    直接用 f-string 的 `<20` 是按字符数补齐的，中英文混排必然错位，
+    来源名一长（github_release_transformers）还会把后一列顶出去。
+    """
+
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
 
 
 async def _seed() -> int:
@@ -33,16 +49,33 @@ async def _list() -> int:
         sources = await source_service.list_sources(session)
         runs = await source_service.latest_runs(session)
 
-    print(f"{'key':<20}{'名称':<22}{'启用':<6}{'健康':<10}{'上次成功':<22}{'最近一批'}")
-    print("-" * 110)
+    header = ("key", "名称", "启用", "健康", "上次成功", "最近一批")
+    rows: list[tuple[str, ...]] = []
     for source in sources:
         run = runs.get(source.id)
-        last_success = source.last_success_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M") if source.last_success_at else "-"
-        run_text = f"{run.status} +{run.created_count}/={run.fetched_count}" if run else "-"
-        print(
-            f"{source.source_key:<20}{source.name:<22}{str(source.enabled):<6}"
-            f"{source.health_status:<10}{last_success:<22}{run_text}"
+        last_success = (
+            source.last_success_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            if source.last_success_at
+            else "-"
         )
+        run_text = f"{run.status} +{run.created_count}/={run.fetched_count}" if run else "-"
+        rows.append(
+            (source.source_key, source.name, str(source.enabled), source.health_status, last_success, run_text)
+        )
+
+    widths = [
+        max(_display_width(header[index]), *(_display_width(row[index]) for row in rows)) if rows
+        else _display_width(header[index])
+        for index in range(len(header))
+    ]
+
+    def render(cells: tuple[str, ...]) -> str:
+        return "  ".join(_pad(cell, widths[i]) for i, cell in enumerate(cells)).rstrip()
+
+    print(render(header))
+    print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for row in rows:
+        print(render(row))
     return 0
 
 

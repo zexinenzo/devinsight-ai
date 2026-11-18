@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.connectors.base import SourceSpec
 from app.connectors.registry import get_connector
 from app.core.config import settings
+from app.core.errors import RateLimitedError
 from app.core.logging import get_logger
 from app.db.models import Document, IngestionRun, Source, SourceHealthLog
 
@@ -58,12 +59,19 @@ async def _record_failure(
     message: str,
     http_status: int | None,
     latency_ms: int,
+    count_as_failure: bool = True,
 ) -> None:
     now = datetime.now(timezone.utc)
     source.last_failure_at = now
     source.last_http_status = http_status
-    source.consecutive_failures = (source.consecutive_failures or 0) + 1
-    source.health_status = "failing" if source.consecutive_failures >= FAILING_THRESHOLD else "degraded"
+    if count_as_failure:
+        source.consecutive_failures = (source.consecutive_failures or 0) + 1
+        source.health_status = "failing" if source.consecutive_failures >= FAILING_THRESHOLD else "degraded"
+    elif source.health_status != "failing":
+        # 限流不是故障：额度耗尽恰恰说明源是好的，只是此刻不该再抓。
+        # 这里不累加 consecutive_failures，否则一个配额很小的源连跑三天
+        # 就会被误判成 failing，运维看到的红灯指向了错误的方向。
+        source.health_status = "degraded"
     session.add(
         SourceHealthLog(
             source_id=source.id,
@@ -130,11 +138,19 @@ async def sync_source(
     except Exception as exc:  # 采集失败不应打断整批任务
         duration_ms = int((time.perf_counter() - started) * 1000)
         message = str(exc) or type(exc).__name__
+        rate_limited = isinstance(exc, RateLimitedError)
         run.status = "failed"
         run.error = message[:1000]
         run.finished_at = datetime.now(timezone.utc)
         run.duration_ms = duration_ms
-        await _record_failure(session, source, message=message, http_status=None, latency_ms=duration_ms)
+        await _record_failure(
+            session,
+            source,
+            message=message,
+            http_status=None,
+            latency_ms=duration_ms,
+            count_as_failure=not rate_limited,
+        )
         await session.commit()
         logger.warning(
             "sync_failed",
@@ -143,6 +159,7 @@ async def sync_source(
                 "run_id": str(run.id),
                 "duration_ms": duration_ms,
                 "error": message[:300],
+                "rate_limited": rate_limited,
             },
         )
         return run
@@ -161,6 +178,10 @@ async def sync_source(
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     run.status = "succeeded"
+    # 只在本次成功时推进游标。失败分支在上面已经 return，旧游标保持不动，
+    # 下一轮从同一位置重试——否则一次网络抖动就会永久跳过一批条目。
+    if outcome.next_cursor is not None:
+        source.sync_cursor = outcome.next_cursor
     run.fetched_count = len(outcome.documents)
     run.created_count = created
     run.skipped_count = len(rows) - created

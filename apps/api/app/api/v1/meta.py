@@ -12,10 +12,40 @@ from app.services.classifier import TOPIC_LABELS
 
 router = APIRouter(tags=["meta"])
 
+# 内容类型的展示名。取值由各 Connector 写入（article / paper / release），
+# 字典只负责翻译，不限制取值 —— 新增来源类型时这里查不到就回落到原值。
+CONTENT_TYPE_LABELS = {
+    "article": "文章",
+    "paper": "论文",
+    "release": "发布说明",
+    "post": "帖子",
+}
+
 
 @router.get("/meta/topics", summary="六大领域字典")
 async def list_topics(request: Request):
     data = [{"slug": slug, "label": label} for slug, label in TOPIC_LABELS.items()]
+    return envelope(request, data, total=len(data))
+
+
+@router.get("/meta/content-types", summary="内容类型分布（只列库里真实存在的）")
+async def list_content_types(request: Request, session: SessionDep):
+    """给前端筛选器用。
+
+    只返回库里出现过的类型，而不是字典里的全部 —— 否则筛选器里会有一半选项
+    点进去是空列表（例如还没有论文时就列出「论文」）。
+    """
+
+    rows = (
+        await session.execute(
+            select(Document.content_type, func.count()).group_by(Document.content_type).order_by(func.count().desc())
+        )
+    ).all()
+    data = [
+        {"value": value, "label": CONTENT_TYPE_LABELS.get(value, value), "count": count}
+        for value, count in rows
+        if value
+    ]
     return envelope(request, data, total=len(data))
 
 

@@ -53,6 +53,7 @@ def _apply_filters(
     region: str | None = None,
     language: str | None = None,
     topic: str | None = None,
+    content_type: str | None = None,
     published_from: datetime | None = None,
     published_to: datetime | None = None,
 ) -> Select:
@@ -67,6 +68,11 @@ def _apply_filters(
         statement = statement.where(Document.language == language)
     if topic:
         statement = statement.where(Document.topics.contains([topic]))
+    if content_type:
+        # 论文 / 发布说明 / 文章 的阅读方式差别很大，混在一起看不出来是哪种。
+        # 取值来自各 Connector 的写入（article / paper / release ...），不设枚举，
+        # 新增来源类型时不需要改这里。
+        statement = statement.where(Document.content_type == content_type)
     if published_from:
         statement = statement.where(Document.published_at >= published_from)
     if published_to:
@@ -82,6 +88,7 @@ async def list_documents(
     region: str | None = None,
     language: str | None = None,
     topic: str | None = None,
+    content_type: str | None = None,
     published_from: datetime | None = None,
     published_to: datetime | None = None,
     limit: int = 20,
@@ -96,6 +103,7 @@ async def list_documents(
         region=region,
         language=language,
         topic=topic,
+        content_type=content_type,
         published_from=published_from,
         published_to=published_to,
     )
@@ -108,6 +116,7 @@ async def list_documents(
         region=region,
         language=language,
         topic=topic,
+        content_type=content_type,
         published_from=published_from,
         published_to=published_to,
     )

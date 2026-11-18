@@ -11,6 +11,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,9 +28,18 @@ class SourceSpec:
     request_timeout_seconds: int = 20
     max_items: int = 200
     parser_version: str = "rss-v1"
+    # 上一次成功采集留下的游标，结构由各 Connector 自行约定。
+    # 为 None 表示该源还没有增量基线，Connector 应退化为全量拉取。
+    cursor: dict[str, Any] | None = None
 
     @classmethod
-    def from_source(cls, source, *, max_items: int = 200) -> "SourceSpec":
+    def from_source(
+        cls,
+        source,
+        *,
+        max_items: int = 200,
+        cursor: dict[str, Any] | None = None,
+    ) -> "SourceSpec":
         """从 ORM Source 构造，避免 Connector 依赖数据库模型细节。"""
 
         return cls(
@@ -42,6 +52,7 @@ class SourceSpec:
             request_timeout_seconds=source.request_timeout_seconds,
             max_items=max_items,
             parser_version=source.parser_version,
+            cursor=cursor if cursor is not None else source.sync_cursor,
         )
 
 
@@ -69,12 +80,15 @@ class CanonicalDocument:
 
 @dataclass(slots=True)
 class FetchOutcome:
-    """一次抓取的结果，包含可观测信息（状态码、耗时）。"""
+    """一次抓取的结果，包含可观测信息（状态码、耗时）与下一轮的游标。"""
 
     documents: list[CanonicalDocument]
     http_status: int | None = None
     latency_ms: int = 0
     not_modified: bool = False
+    # 采集服务只在本次成功且 next_cursor 非空时才覆盖 sources.sync_cursor。
+    # 失败时不写回，保证游标只会前进到"确实抓取成功"的位置。
+    next_cursor: dict[str, Any] | None = None
 
 
 class BaseConnector(ABC):
@@ -84,7 +98,11 @@ class BaseConnector(ABC):
         self.spec = spec
 
     @abstractmethod
-    async def fetch(self, cursor: str | None = None) -> FetchOutcome:
-        """抓取并解析，返回规范化文档列表。"""
+    async def fetch(self, cursor: dict[str, Any] | None = None) -> FetchOutcome:
+        """抓取并解析，返回规范化文档列表。
+
+        cursor 为上一轮成功采集留下的游标（结构由各 Connector 自定）；
+        为 None 时从 spec.cursor 兜底，两者都为空则表示还没有增量基线。
+        """
 
         raise NotImplementedError

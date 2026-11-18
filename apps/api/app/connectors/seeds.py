@@ -82,6 +82,105 @@ SOURCE_SEEDS: tuple[SourceSeed, ...] = (
         robots_url="https://openai.com/robots.txt",
         rights_note="厂商官方发布，作为一手来源；仍与公告口径、后续修订区分记录。",
     ),
+    # --- 阶段 2：API 源（按 item id 增量，游标存 sources.sync_cursor）---
+    SourceSeed(
+        source_key="hackernews_en",
+        name="Hacker News",
+        canonical_domain="news.ycombinator.com",
+        source_type="community",
+        access_method="api",
+        base_url="https://hacker-news.firebaseio.com/v0",
+        region="global",
+        language="en",
+        # 社区投票榜，热度高不等于可信，可信度低于媒体与官方源
+        credibility_tier="C",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=30,
+        rate_limit_per_minute=60,
+        parser_version="api-hn-v1",
+        rights_note="社区提交聚合，多为站外原文链接。仅保存标题、讨论页地址与自帖正文摘要，外链正文不入库。",
+    ),
+    # --- 阶段 2：GitHub Release（base_url 即 owner/repo，游标记 release id + ETag）---
+    # 只挑"版本变化等于能力边界变化"的项目：推理引擎、模型库、本地运行时。
+    # 匿名配额 60 次/小时是全局共享的，三个仓库各 120 分钟一轮 ≈ 1.5 次/小时。
+    # ETag 命中 304 时不计配额，但命中率取决于两次轮询之间有没有人下载，
+    # 不能当作配额预算的一部分。
+    SourceSeed(
+        source_key="github_release_vllm",
+        name="vLLM Releases",
+        canonical_domain="github.com",
+        source_type="repo",
+        access_method="api",
+        base_url="https://api.github.com/repos/vllm-project/vllm",
+        region="global",
+        language="en",
+        credibility_tier="A",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=120,
+        rate_limit_per_minute=10,
+        parser_version="api-github-v1",
+        rights_note="开源项目版本发布说明。存 tag、发布时间与 Notes 摘要，正文链接回 GitHub。",
+    ),
+    SourceSeed(
+        source_key="github_release_transformers",
+        name="Transformers Releases",
+        canonical_domain="github.com",
+        source_type="repo",
+        access_method="api",
+        base_url="https://api.github.com/repos/huggingface/transformers",
+        region="global",
+        language="en",
+        credibility_tier="A",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=120,
+        rate_limit_per_minute=10,
+        parser_version="api-github-v1",
+        rights_note="开源项目版本发布说明。存 tag、发布时间与 Notes 摘要，正文链接回 GitHub。",
+    ),
+    SourceSeed(
+        source_key="github_release_ollama",
+        name="Ollama Releases",
+        canonical_domain="github.com",
+        source_type="repo",
+        access_method="api",
+        base_url="https://api.github.com/repos/ollama/ollama",
+        region="global",
+        language="en",
+        credibility_tier="A",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=120,
+        rate_limit_per_minute=10,
+        parser_version="api-github-v1",
+        rights_note="开源项目版本发布说明。存 tag、发布时间与 Notes 摘要，正文链接回 GitHub。",
+    ),
+    # --- 阶段 2：arXiv（Atom over HTTPS，游标记 latest_published）---
+    # 分类条件写在 base_url 里：想只看 cs.CL 就再加一个来源，不用改代码。
+    # 轮询间隔给到 240 分钟，因为 arXiv 的限流是"1 请求 / 3 秒"的硬墙，
+    # 超限直接 429 且不给 Retry-After —— 这个源的价值在于不漏新论文，
+    # 而不是比别人快几分钟。
+    SourceSeed(
+        source_key="arxiv_cs_ai",
+        name="arXiv cs.AI / cs.LG / cs.CL",
+        canonical_domain="arxiv.org",
+        source_type="preprint",
+        access_method="api",
+        base_url="https://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.LG+OR+cat:cs.CL",
+        region="global",
+        language="en",
+        # 预印本未经同行评审，可信度低于官方发布
+        credibility_tier="B",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=240,
+        request_timeout_seconds=30,
+        rate_limit_per_minute=1,
+        parser_version="api-arxiv-v1",
+        rights_note="预印本平台，未经同行评审。仅保存标题、摘要与 abs 页链接，PDF 不入库。",
+    ),
     # --- 以下为候选源：先注册、默认停用，阶段 2 逐个健康检查后再开启 ---
     SourceSeed(
         source_key="deepmind_blog_en",
