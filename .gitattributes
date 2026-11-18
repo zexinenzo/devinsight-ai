@@ -1,0 +1,7 @@
+# 项目在 WSL 里运行，工作区统一用 LF，避免 Windows 编辑器把 shell/Makefile 写成 CRLF
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
