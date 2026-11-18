@@ -54,9 +54,10 @@ make beat          # 每 5 分钟派发到期来源
 | GET | `/api/v1/sources/{id}` | 来源详情 |
 | GET | `/api/v1/sources/{id}/health` | 最近 10 次 run + 20 条健康日志 |
 | POST | `/api/v1/admin/sources/{id}/sync` | 手动触发同步（优先入 Celery，broker 不可用则进程内执行） |
-| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/from/to/limit/cursor` |
+| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/limit/cursor` |
 | GET | `/api/v1/documents/{id}` | 文档详情 |
 | GET | `/api/v1/meta/topics` | 六大领域字典 |
+| GET | `/api/v1/meta/content-types` | 内容类型分布（只列库里真实存在的类型，带条数） |
 | GET | `/api/v1/stats` | 总览统计（按来源/地区/领域） |
 
 统一响应：`{ data, meta: { request_id, timestamp, total, next_cursor }, error }`。
@@ -67,13 +68,13 @@ make beat          # 每 5 分钟派发到期来源
 apps/api/            FastAPI 后端
   app/core/          配置、日志、错误
   app/db/            模型（sources / ingestion_runs / documents / source_health_logs）、会话
-  app/connectors/    Connector 抽象、RSS 实现、来源种子数据
+  app/connectors/    Connector 抽象、registry 分派、RSS / HN / GitHub Release / arXiv 实现、来源种子
   app/services/      采集、来源、文档查询、规则分类
   app/api/v1/        路由
   app/worker/        Celery 应用与任务
-  migrations/        Alembic（0001_init）
-  tests/             单元测试（URL/时间/文本/分类 + RSS 合约）
-apps/web/            Next.js 前端（/intelligence 情报流、/sources 来源状态）
+  migrations/        Alembic（0001_init、0002_source_sync_cursor）
+  tests/             单元测试（URL/时间/文本/分类）与各 Connector 合约测试
+apps/web/            Next.js 前端（/intelligence 情报流 + 类型/来源/领域筛选、/sources 来源状态）
 ```
 
 ## 关键设计决策

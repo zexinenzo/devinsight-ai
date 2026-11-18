@@ -5,9 +5,11 @@ import {
   ApiError,
   formatDateTime,
   formatRelative,
+  listContentTypes,
   listDocuments,
   listSources,
   listTopics,
+  type ContentType,
   type DocumentListItem,
   type Source,
   type Topic,
@@ -22,6 +24,29 @@ const TIER_STYLE: Record<string, { label: string; className: string }> = {
   C: { label: "C 社区线索", className: "bg-amber-50 text-amber-700 dark:bg-amber-950 dark:text-amber-300" },
   D: { label: "D 模型推断", className: "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300" },
 };
+
+/**
+ * 内容类型标识。只给非默认类型加徽章 —— 新闻（article）占 500 多条，
+ * 每条都挂一个「文章」标签等于没有信息量；论文和发布说明才是需要一眼区分的。
+ */
+const CONTENT_TYPE_STYLE: Record<string, { label: string; className: string }> = {
+  paper: { label: "论文", className: "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300" },
+  release: { label: "发布说明", className: "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300" },
+};
+
+/** 质量标记的可读化。原始值是代码约定（snake_case），直接摆给用户看不懂。 */
+const FLAG_LABELS: Record<string, string> = {
+  missing_summary: "缺摘要",
+  missing_published_at: "缺发布时间",
+  implausible_published_at: "发布时间可疑",
+  missing_url: "缺原文链接",
+  self_post: "自帖",
+  prerelease: "预发布",
+};
+
+function flagLabel(flag: string): string {
+  return FLAG_LABELS[flag] ?? flag;
+}
 
 function buildHref(params: Record<string, string | undefined>, patch: Record<string, string | undefined>) {
   const merged = new URLSearchParams();
@@ -39,22 +64,41 @@ function pick(raw: Record<string, string | string[] | undefined>, key: string): 
 
 function DocumentCard({ document }: { document: DocumentListItem }) {
   const tier = TIER_STYLE[document.source.credibility_tier] ?? TIER_STYLE.B;
+  const contentType = CONTENT_TYPE_STYLE[document.content_type];
+  const isPaper = document.content_type === "paper";
+  const flags = document.quality_flags.map(flagLabel);
+  const visibleFlags = flags.slice(0, 2);
+  const hiddenFlagCount = flags.length - visibleFlags.length;
 
   return (
     <article className="rounded-xl border border-zinc-200 bg-white p-5 transition hover:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700">
       <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+        {contentType && (
+          <span className={`rounded px-1.5 py-0.5 font-medium ${contentType.className}`}>{contentType.label}</span>
+        )}
         <span className="font-medium text-zinc-700 dark:text-zinc-300">{document.source.name}</span>
         <span className={`rounded px-1.5 py-0.5 font-medium ${tier.className}`}>{tier.label}</span>
         <span className="text-zinc-400">{document.region === "cn" ? "中国" : "全球"}</span>
         {document.language && <span className="uppercase text-zinc-400">{document.language}</span>}
-        {document.quality_flags.length > 0 && (
-          <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-            质量标记 {document.quality_flags.length}
+        {visibleFlags.map((flag) => (
+          <span
+            key={flag}
+            className="rounded bg-amber-50 px-1.5 py-0.5 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+          >
+            {flag}
+          </span>
+        ))}
+        {hiddenFlagCount > 0 && (
+          <span
+            className="rounded bg-zinc-100 px-1.5 py-0.5 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"
+            title={flags.join("、")}
+          >
+            +{hiddenFlagCount}
           </span>
         )}
       </div>
 
-      <h2 className="text-base font-semibold leading-6 tracking-tight">
+      <h2 className={`text-base font-semibold tracking-tight ${isPaper ? "leading-7" : "leading-6"}`}>
         <a
           href={document.original_url ?? document.canonical_url}
           target="_blank"
@@ -65,8 +109,14 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
         </a>
       </h2>
 
-      {document.summary && (
-        <p className="mt-2 line-clamp-2 text-sm leading-6 text-zinc-600 dark:text-zinc-400">{document.summary}</p>
+      {document.summary ? (
+        <p className={`mt-2 text-sm leading-6 text-zinc-600 dark:text-zinc-400 ${isPaper ? "line-clamp-3" : "line-clamp-2"}`}>
+          {document.summary}
+        </p>
+      ) : (
+        <p className="mt-2 text-sm italic leading-6 text-zinc-400 dark:text-zinc-500">
+          原文未提供摘要 —— 正文需抓取原文后补全
+        </p>
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500 dark:text-zinc-500">
@@ -101,6 +151,7 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
     source: pick(raw, "source"),
     region: pick(raw, "region"),
     topic: pick(raw, "topic"),
+    content_type: pick(raw, "content_type"),
   };
 
   let items: DocumentListItem[] = [];
@@ -108,19 +159,22 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
   let nextCursor: string | null = null;
   let sources: Source[] = [];
   let topics: Topic[] = [];
+  let contentTypes: ContentType[] = [];
   let errorMessage: string | null = null;
 
   try {
-    const [page, sourceList, topicList] = await Promise.all([
+    const [page, sourceList, topicList, typeList] = await Promise.all([
       listDocuments({ ...filters, limit: 20, cursor: pick(raw, "cursor") }),
       listSources(),
       listTopics(),
+      listContentTypes(),
     ]);
     items = page.items;
     total = page.total;
     nextCursor = page.nextCursor;
     sources = sourceList;
     topics = topicList;
+    contentTypes = typeList;
   } catch (error) {
     errorMessage = error instanceof ApiError ? error.message : "加载情报失败";
   }
@@ -162,6 +216,18 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
             <option value="">全部地区</option>
             <option value="cn">中国</option>
             <option value="global">全球</option>
+          </select>
+          <select
+            name="content_type"
+            defaultValue={filters.content_type ?? ""}
+            className="h-9 rounded-md border border-zinc-300 bg-white px-2 dark:border-zinc-700 dark:bg-zinc-900"
+          >
+            <option value="">全部类型</option>
+            {contentTypes.map((type) => (
+              <option key={type.value} value={type.value}>
+                {type.label}（{type.count}）
+              </option>
+            ))}
           </select>
           <select
             name="topic"

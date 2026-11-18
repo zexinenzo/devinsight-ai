@@ -84,6 +84,9 @@ export type Source = {
 
 export type Topic = { slug: string; label: string };
 
+/** 内容类型分布。只包含库里真实存在的类型，避免筛选器出现点进去是空的选项。 */
+export type ContentType = { value: string; label: string; count: number };
+
 export class ApiError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -124,6 +127,7 @@ export type DocumentQuery = {
   source?: string;
   region?: string;
   topic?: string;
+  content_type?: string;
   limit?: number;
   cursor?: string;
 };
@@ -148,6 +152,11 @@ export async function listSources(): Promise<Source[]> {
 
 export async function listTopics(): Promise<Topic[]> {
   const envelope = await request<Topic[]>("/meta/topics");
+  return envelope.data ?? [];
+}
+
+export async function listContentTypes(): Promise<ContentType[]> {
+  const envelope = await request<ContentType[]>("/meta/content-types");
   return envelope.data ?? [];
 }
 
