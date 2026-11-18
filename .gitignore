@@ -22,3 +22,7 @@ out/
 .idea/
 .vscode/
 .DS_Store
+
+# 文档产物（二进制，走 Release 附件）
+output/
+*.docx
