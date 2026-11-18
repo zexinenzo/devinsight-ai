@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Suspense } from "react";
 
 import {
   ApiError,
@@ -29,6 +30,11 @@ function buildHref(params: Record<string, string | undefined>, patch: Record<str
   }
   const query = merged.toString();
   return query ? `/intelligence?${query}` : "/intelligence";
+}
+
+function pick(raw: Record<string, string | string[] | undefined>, key: string): string | undefined {
+  const value = raw[key];
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function DocumentCard({ document }: { document: DocumentListItem }) {
@@ -64,9 +70,7 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
       )}
 
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500 dark:text-zinc-500">
-        <span>
-          发布 {document.published_at ? formatDateTime(document.published_at) : "未知"}
-        </span>
+        <span>发布 {document.published_at ? formatDateTime(document.published_at) : "未知"}</span>
         <span>
           采集 {formatDateTime(document.fetched_at)}（{formatRelative(document.fetched_at)}）
         </span>
@@ -84,15 +88,19 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
   );
 }
 
-export default async function IntelligencePage({ searchParams }: { searchParams: SearchParams }) {
+/**
+ * 数据区。await searchParams 与三次取数都必须落在这个 Suspense 边界内：
+ * Next 16 开启 cacheComponents 后，运行时数据（searchParams、no-store fetch）
+ * 出现在边界外会让整个路由无法预渲染，构建直接报 blocking-prerender-dynamic。
+ */
+async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams }) {
   const raw = await searchParams;
-  const pick = (key: string) => (typeof raw[key] === "string" && raw[key] ? (raw[key] as string) : undefined);
 
   const filters = {
-    q: pick("q"),
-    source: pick("source"),
-    region: pick("region"),
-    topic: pick("topic"),
+    q: pick(raw, "q"),
+    source: pick(raw, "source"),
+    region: pick(raw, "region"),
+    topic: pick(raw, "topic"),
   };
 
   let items: DocumentListItem[] = [];
@@ -104,7 +112,7 @@ export default async function IntelligencePage({ searchParams }: { searchParams:
 
   try {
     const [page, sourceList, topicList] = await Promise.all([
-      listDocuments({ ...filters, limit: 20, cursor: pick("cursor") }),
+      listDocuments({ ...filters, limit: 20, cursor: pick(raw, "cursor") }),
       listSources(),
       listTopics(),
     ]);
@@ -186,8 +194,7 @@ export default async function IntelligencePage({ searchParams }: { searchParams:
         <div className="rounded-xl border border-amber-300 bg-amber-50 p-5 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
           <p className="font-medium">{errorMessage}</p>
           <p className="mt-2 text-amber-700 dark:text-amber-300">
-            在仓库根目录执行 <code className="rounded bg-amber-100 px-1 dark:bg-amber-900">cd apps/api &amp;&amp; uvicorn app.main:app --port 8000</code>{" "}
-            后刷新本页。
+            在仓库根目录执行 <code className="rounded bg-amber-100 px-1 dark:bg-amber-900">make api</code> 后刷新本页。
           </p>
         </div>
       )}
@@ -196,8 +203,7 @@ export default async function IntelligencePage({ searchParams }: { searchParams:
         <div className="rounded-xl border border-dashed border-zinc-300 p-10 text-center text-sm text-zinc-500 dark:border-zinc-700">
           <p className="font-medium text-zinc-700 dark:text-zinc-300">还没有情报</p>
           <p className="mt-2">
-            执行 <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">python -m app.cli sync --all</code>{" "}
-            采集一轮，数据会自动出现在这里。
+            执行 <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">make sync</code> 采集一轮，数据会自动出现在这里。
           </p>
         </div>
       )}
@@ -219,5 +225,45 @@ export default async function IntelligencePage({ searchParams }: { searchParams:
         </div>
       )}
     </div>
+  );
+}
+
+/** 骨架：与真实布局同尺寸，避免数据到达时页面跳动 */
+function BoardSkeleton() {
+  return (
+    <div className="space-y-6" aria-busy="true" aria-label="正在加载情报">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">情报流</h1>
+          <p className="mt-1 text-sm text-zinc-400">正在加载…</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <div className="h-9 w-52 animate-pulse rounded-md bg-zinc-200 dark:bg-zinc-800" />
+          <div className="h-9 w-28 animate-pulse rounded-md bg-zinc-200 dark:bg-zinc-800" />
+          <div className="h-9 w-24 animate-pulse rounded-md bg-zinc-200 dark:bg-zinc-800" />
+          <div className="h-9 w-24 animate-pulse rounded-md bg-zinc-200 dark:bg-zinc-800" />
+        </div>
+      </div>
+      <div className="space-y-3">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <div
+            key={index}
+            className="rounded-xl border border-zinc-200 bg-white p-5 dark:border-zinc-800 dark:bg-zinc-900"
+          >
+            <div className="mb-3 h-3 w-40 animate-pulse rounded bg-zinc-200 dark:bg-zinc-800" />
+            <div className="h-4 w-3/4 animate-pulse rounded bg-zinc-200 dark:bg-zinc-800" />
+            <div className="mt-3 h-3 w-1/2 animate-pulse rounded bg-zinc-100 dark:bg-zinc-800/60" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default function IntelligencePage({ searchParams }: { searchParams: SearchParams }) {
+  return (
+    <Suspense fallback={<BoardSkeleton />}>
+      <IntelligenceBoard searchParams={searchParams} />
+    </Suspense>
   );
 }

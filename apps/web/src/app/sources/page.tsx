@@ -1,3 +1,5 @@
+import { Suspense } from "react";
+
 import { ApiError, formatDateTime, formatRelative, listSources, type Source } from "@/lib/api";
 
 const HEALTH_STYLE: Record<string, { dot: string; label: string }> = {
@@ -8,8 +10,11 @@ const HEALTH_STYLE: Record<string, { dot: string; label: string }> = {
   disabled: { dot: "bg-zinc-300", label: "已停用" },
 };
 
-function HealthBadge({ status }: { status: string }) {
-  const style = HEALTH_STYLE[status] ?? HEALTH_STYLE.unknown;
+function HealthBadge({ status, enabled }: { status: string; enabled: boolean }) {
+  // 停用的来源后端不探测，health_status 会一直是 unknown；
+  // 直接显示「未探测」会被误读成异常，这里优先表达"是停用而不是坏了"
+  const key = !enabled && status === "unknown" ? "disabled" : status;
+  const style = HEALTH_STYLE[key] ?? HEALTH_STYLE.unknown;
   return (
     <span className="inline-flex items-center gap-1.5">
       <span className={`size-2 rounded-full ${style.dot}`} />
@@ -31,7 +36,10 @@ function RunCell({ source }: { source: Source }) {
   );
 }
 
-export default async function SourcesPage() {
+const STAT_CARDS = ["已注册来源", "已启用", "健康", "连续失败"] as const;
+
+/** 取数区，必须落在 Suspense 内（cacheComponents 的运行时数据约束），理由同情报流页面 */
+async function SourceBoard() {
   let sources: Source[] = [];
   let errorMessage: string | null = null;
 
@@ -44,6 +52,7 @@ export default async function SourcesPage() {
   const enabled = sources.filter((source) => source.enabled);
   const healthy = sources.filter((source) => source.health_status === "healthy");
   const failing = sources.filter((source) => source.health_status === "failing");
+  const stats = [sources.length, enabled.length, healthy.length, failing.length];
 
   return (
     <div className="space-y-6">
@@ -61,18 +70,13 @@ export default async function SourcesPage() {
       ) : (
         <>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {[
-              { label: "已注册来源", value: sources.length },
-              { label: "已启用", value: enabled.length },
-              { label: "健康", value: healthy.length },
-              { label: "连续失败", value: failing.length },
-            ].map((item) => (
+            {STAT_CARDS.map((label, index) => (
               <div
-                key={item.label}
+                key={label}
                 className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
               >
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">{item.label}</div>
-                <div className="mt-1 text-2xl font-semibold tabular-nums">{item.value}</div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">{label}</div>
+                <div className="mt-1 text-2xl font-semibold tabular-nums">{stats[index]}</div>
               </div>
             ))}
           </div>
@@ -110,7 +114,7 @@ export default async function SourcesPage() {
                       <div className="text-xs">分层 {source.credibility_tier}</div>
                     </td>
                     <td className="px-4 py-3">
-                      <HealthBadge status={source.health_status} />
+                      <HealthBadge status={source.health_status} enabled={source.enabled} />
                       {source.consecutive_failures > 0 && (
                         <div className="mt-1 text-xs text-red-600 dark:text-red-400">
                           连续失败 {source.consecutive_failures} 次
@@ -140,5 +144,40 @@ export default async function SourcesPage() {
         </>
       )}
     </div>
+  );
+}
+
+function SourceSkeleton() {
+  return (
+    <div className="space-y-6" aria-busy="true" aria-label="正在加载数据源">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">数据源</h1>
+        <p className="mt-1 text-sm text-zinc-400">正在加载…</p>
+      </div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {STAT_CARDS.map((label) => (
+          <div
+            key={label}
+            className="rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900"
+          >
+            <div className="text-xs text-zinc-500 dark:text-zinc-400">{label}</div>
+            <div className="mt-1 h-7 w-10 animate-pulse rounded bg-zinc-200 dark:bg-zinc-800" />
+          </div>
+        ))}
+      </div>
+      <div className="space-y-2 rounded-xl border border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900">
+        {Array.from({ length: 5 }).map((_, index) => (
+          <div key={index} className="h-10 animate-pulse rounded bg-zinc-100 dark:bg-zinc-800/60" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export default function SourcesPage() {
+  return (
+    <Suspense fallback={<SourceSkeleton />}>
+      <SourceBoard />
+    </Suspense>
   );
 }

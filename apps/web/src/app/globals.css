@@ -8,7 +8,9 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  /* 西文用 Geist，中文按平台回落到系统黑体；不写中文回落时中文字形会显得脏 */
+  --font-sans: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", "Noto Sans SC", ui-sans-serif, system-ui,
+    sans-serif;
   --font-mono: var(--font-geist-mono);
 }
 
@@ -22,5 +24,6 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  /* 原本是 Arial, Helvetica, sans-serif，会把 layout 里加载的 Geist 整个覆盖掉 */
+  font-family: var(--font-sans);
 }
