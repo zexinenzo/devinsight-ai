@@ -138,7 +138,12 @@ async def sync_source(
         await session.commit()
         logger.warning(
             "sync_failed",
-            extra={"source_id": source.source_key, "run_id": str(run.id), "duration_ms": duration_ms},
+            extra={
+                "source_id": source.source_key,
+                "run_id": str(run.id),
+                "duration_ms": duration_ms,
+                "error": message[:300],
+            },
         )
         return run
 

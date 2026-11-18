@@ -1,9 +1,12 @@
 # 本地开发一键命令。在仓库根目录执行，使用仓库根的 .venv。
 
 SHELL := /bin/bash
-PY := .venv/bin/python
-API := apps/api
-WEB := apps/web
+# 用绝对路径引用解释器：相对路径会让 Python 解析出的 sys.prefix 带 ../..，
+# Python 3.14 会为此刷 RuntimeWarning，污染每条命令的输出。
+ROOT := $(CURDIR)
+PY := $(ROOT)/.venv/bin/python
+API := $(ROOT)/apps/api
+WEB := $(ROOT)/apps/web
 
 .PHONY: help check-docker up down logs wait-db migrate seed sync status docs api worker beat web test lint fmt
 
@@ -36,37 +39,37 @@ logs: check-docker ## 跟踪数据库与 Redis 日志
 	docker compose logs -f db redis
 
 migrate: ## 执行数据库迁移到最新版本
-	cd $(API) && ../../$(PY) -m alembic upgrade head
+	cd $(API) && $(PY) -m alembic upgrade head
 
 seed: ## 写入内置来源注册表（幂等）
-	cd $(API) && ../../$(PY) -m app.cli seed
+	cd $(API) && $(PY) -m app.cli seed
 
 sync: ## 立刻采集所有启用来源
-	cd $(API) && ../../$(PY) -m app.cli sync --all
+	cd $(API) && $(PY) -m app.cli sync --all
 
 status: ## 查看来源健康与最近批次
-	cd $(API) && ../../$(PY) -m app.cli list
+	cd $(API) && $(PY) -m app.cli list
 
 docs: ## 查看最新入库情报
-	cd $(API) && ../../$(PY) -m app.cli docs --limit 15
+	cd $(API) && $(PY) -m app.cli docs --limit 15
 
 api: ## 启动 FastAPI（热重载，:8000）
-	cd $(API) && ../../$(PY) -m uvicorn app.main:app --reload --port 8000
+	cd $(API) && $(PY) -m uvicorn app.main:app --reload --port 8000
 
 worker: ## 启动 Celery Worker
-	cd $(API) && ../../$(PY) -m celery -A app.worker.celery_app:celery_app worker -l info
+	cd $(API) && $(PY) -m celery -A app.worker.celery_app:celery_app worker -l info
 
 beat: ## 启动 Celery Beat（每 5 分钟派发到期来源）
-	cd $(API) && ../../$(PY) -m celery -A app.worker.celery_app:celery_app beat -l info
+	cd $(API) && $(PY) -m celery -A app.worker.celery_app:celery_app beat -l info
 
 web: ## 启动 Next.js（:3000）
 	cd $(WEB) && npm run dev
 
 test: ## 运行后端单元测试
-	cd $(API) && ../../$(PY) -m pytest
+	cd $(API) && $(PY) -m pytest
 
 lint: ## ruff 静态检查
-	cd $(API) && ../../$(PY) -m ruff check .
+	cd $(API) && $(PY) -m ruff check .
 
 fmt: ## ruff 自动格式化
-	cd $(API) && ../../$(PY) -m ruff format .
+	cd $(API) && $(PY) -m ruff format .

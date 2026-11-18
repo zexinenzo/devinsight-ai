@@ -159,7 +159,9 @@ class RSSConnector(BaseConnector):
         try:
             response = await self._request(client)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise UpstreamError(f"{self.spec.source_key}: 网络请求失败（{type(exc).__name__}）") from exc
+            # 保留底层 message：DNS 解析失败 / 连接被拒 / 代理不通 在这里能直接区分，
+            # 只留异常类名会让排查退化成猜谜。
+            raise UpstreamError(f"{self.spec.source_key}: 网络请求失败（{type(exc).__name__}: {exc}）") from exc
         except RetryableUpstreamStatus as exc:
             raise UpstreamError(f"{self.spec.source_key}: 上游持续返回 {exc.status_code}") from exc
         finally:
