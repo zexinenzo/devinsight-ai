@@ -89,9 +89,25 @@ apps/web/            Next.js 前端（/intelligence 情报流、/sources 来源�
 
 现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
 
-两个独立根因，可能同时存在：
+三个独立根因，可能同时存在：
 
-**1. WSLInterop 未注册**
+**1. PATH 里 `/Docker/host/bin` 抢占了 `docker` 这个名字（最常见）**
+
+Docker Desktop 会往 PATH 里塞 `/Docker/host/bin`，那里的 `docker` 是转发到 Windows `docker.exe` 的脚本，必须先有下面的 WSLInterop 才能跑。而它同时也注入了 Linux 原生客户端（`/usr/bin/docker` → `cli-tools/usr/bin/docker`）和 compose 插件（`/usr/local/lib/docker/cli-plugins/docker-compose`），这两者**不依赖 interop**。
+
+```bash
+type -a docker        # 首行若是 /Docker/host/bin/docker，就是这个问题
+ls -l /usr/bin/docker # 确认原生客户端确实存在
+```
+
+修复：把 `/Docker/host/bin` 从 PATH 中摘掉即可（本质是让原生客户端胜出，比修 interop 更稳，重启不丢）：
+
+```bash
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx '/Docker/host/bin' | paste -sd: -)"
+export PATH && hash -r
+```
+
+**2. WSLInterop 未注册**
 WSL 执行 Windows `.exe` 依赖 `binfmt_misc` 里的 `WSLInterop` 条目，缺失时任何 `.exe` 都会报 `Exec format error`。
 
 ```bash
@@ -108,7 +124,7 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
 
 回滚：`echo -1 | sudo tee /proc/sys/fs/binfmt_misc/WSLInterop`
 
-**2. Docker Desktop 的 CLI 注入不全**
+**3. Docker Desktop 的 CLI 注入不全**
 `/usr/bin/docker` 是指向 `/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker` 的符号链接；若 `cli-tools` 节点没挂上，链接就是悬空的。修复：Windows 侧 `wsl --shutdown`，等 8 秒后重开 Ubuntu 终端，让 Docker Desktop 重新注入。
 
 **应急通道**
