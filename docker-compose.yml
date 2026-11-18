@@ -1,6 +1,8 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    # Docker Desktop / WSL 重启后容器不会自动回来，没有这条本地开发会莫名其妙连不上库
+    restart: unless-stopped
     environment:
       POSTGRES_DB: devinsight
       POSTGRES_USER: devinsight
@@ -17,6 +19,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
 
