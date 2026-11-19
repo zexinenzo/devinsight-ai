@@ -83,7 +83,7 @@ make beat          # 见下方「自动跑的三件事」
 | GET | `/api/v1/sources/{id}` | 来源详情 |
 | GET | `/api/v1/sources/{id}/health` | 最近 10 次 run + 20 条健康日志 |
 | POST | `/api/v1/admin/sources/{id}/sync` | 手动触发同步（优先入 Celery，broker 不可用则进程内执行） |
-| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/sort/limit/cursor/mode` |
+| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/sort/limit/cursor/mode/rerank` |
 | GET | `/api/v1/documents/{id}` | 文档详情 |
 | GET | `/api/v1/meta/topics` | 六大领域字典 |
 | GET | `/api/v1/meta/content-types` | 内容类型分布（只列库里真实存在的类型，带条数） |
@@ -96,13 +96,15 @@ make beat          # 见下方「自动跑的三件事」
 ```
 apps/api/            FastAPI 后端
   app/core/          配置、日志、错误
-  app/db/            模型（sources / ingestion_runs / documents / source_health_logs）、会话
+  app/db/            模型（sources / ingestion_runs / documents / document_chunks / source_health_logs）、会话
   app/connectors/    Connector 抽象、registry 分派、RSS / HN / GitHub Release / arXiv 实现、来源种子
-  app/services/      采集、来源、文档查询、规则分类
+  app/services/      采集、来源、文档查询、切块与向量化、精排、规则分类
   app/api/v1/        路由
   app/worker/        Celery 应用与任务
-  migrations/        Alembic（0001_init、0002_source_sync_cursor）
-  tests/             单元测试（URL/时间/文本/分类）与各 Connector 合约测试
+  migrations/        Alembic（0001_init … 0008_document_chunks）
+  tests/             单元测试（URL/时间/文本/分类/切块/检索/重排）与各 Connector 合约测试
+  data/              评测集（eval_questions.json，40 题四类）
+scripts/             模型下载（embedding / reranker）、检索评测、历史回填
 apps/web/            Next.js 前端（/intelligence 情报流 + 类型/来源/领域筛选、/sources 来源状态）
 ```
 
@@ -380,15 +382,19 @@ abs 页的模板文字（分类路径、编号、Submitted on、View PDF、Abstr
 
 ### 问题：关键词检索够不着正文
 
-`q` 参数目前匹配的是标题和摘要。实测一句正文里的话：
+`q` 参数匹配的是标题和摘要。实测一句只出现在正文第 1,500 字的话
+（出自《每周分享第 46 期》，全文 9,670 字）：
 
 ```
-GET /api/v1/documents?q=乌兰察布 数据中心&mode=keyword   → 0 条
-GET /api/v1/documents?q=乌兰察布 数据中心&mode=vector    → 2 条（相似度 0.23 / 0.22）
+GET /api/v1/documents?q=流浪猫只需要刷脸就能进入猫窝 它能准确识别174种不同种类的猫咪
+  mode=keyword → 0 条
+  mode=vector  → 3 条，目标文档排第 1（相似度 0.917，char_start=1215）
+  mode=hybrid  → 3 条，目标文档排第 1（相似度 0.917）
 ```
 
-那篇文章的标题是《机房来了，写字楼走了》，"乌兰察布"只出现在正文里。这不是模型问题，
-是输入问题：标题里没有的字，`ILIKE` 永远搜不到。
+这不是模型问题，是输入问题：标题摘要里没有的字，`ILIKE` 永远搜不到。片段兜底
+（把问句切成二元组）能救一部分，但这句话切成片段后在全库里命中几千条，
+排不到前面——**字面匹配在长正文上结构性地失效**，这正是向量检索存在的理由。
 
 ### 但正文不能入库
 
@@ -449,18 +455,24 @@ python scripts/fetch_embedding_model.py --check   # 只检查不下载
 # 2. 用已入库正文补索引（存量补课；新条目随 enrich 自动索引）
 cd apps/api && python -m app.cli embed --limit 500
 #    换模型后必须重算：python -m app.cli embed --reindex
+#    只补标题摘要块（每篇一条，61 秒）：python -m app.cli embed --headers-only
 
 # 3. 检索
 curl "localhost:8000/api/v1/documents?q=乌兰察布的数据中心&mode=vector"
 curl "localhost:8000/api/v1/documents?q=乌兰察布的数据中心&mode=hybrid"
+#    不要精排（省 0.6 秒）加 &rerank=false；要求必须精排加 &rerank=true
 ```
 
 `mode` 三档：`keyword`（默认，ILIKE）／`vector`（纯向量）／`hybrid`（RRF 融合）。
 命中结果多一个 `match` 字段：
 
 ```json
-"match": { "mode": "vector", "similarity": 0.917, "char_start": 1215 }
+"match": { "mode": "hybrid", "similarity": 0.917, "char_start": 1215, "rerank_score": 4.31 }
 ```
+
+`rerank_score` 是 cross-encoder 给的原始 logit，只用于解释排序，**不要当概率看**：
+int8 量化会改变它的绝对量级，跨模型、跨语料都不可比。响应 `meta.reranked` 说明这次
+排序有没有真的经过精排——模型没下载时它是 `false`，而不是让调用方以为排过。
 
 ### 语义检索不支持游标翻页
 
@@ -474,15 +486,17 @@ curl "localhost:8000/api/v1/documents?q=乌兰察布的数据中心&mode=hybrid"
 |---|---|
 | 可索引文档（正文 > 400 字） | 737 |
 | 已索引文档 | 737（100%） |
-| 已索引块 | 8,714 |
+| 正文块 | 8,714 |
+| 标题摘要块 | 1,431（每篇一条，`chunk_index = -1`） |
 | 每篇块数 | 平均 11.8，最多 32，最少 2 |
 | 块大小 | 400 字 / 重叠 80 字（`chunk_text`，按句子边界断） |
 | 只索引到 600 字片段 | 338 篇（授权级别所限） |
-| 全量重建耗时 | 约 23 分钟（CPU 单进程，约 0.18 秒/块） |
+| 全量重建耗时 | 正文约 23 分钟（0.18 秒/块），标题块 61 秒 |
+| 重排耗时 | 40 条候选约 0.6 秒（15 ms/条） |
 | 正文原句查询 | `keyword` 0 条 → `vector` 1 条（目标文档，similarity 0.917，`char_start=1215`） |
 | 专有名词查询 | `keyword` 命中标题第 1 名，`hybrid` 把它抬到融合结果第 2 位 |
 
-**已知短板（实测，不是推测）**：`topic` 类召回只有 0.583，前 3 名相似度差常常不到 0.01。这套检索解决"找得到"，不解决"排得准"——产品上应把它当召回层，需要精排就在上面叠 rerank。下一节的评测集把这些数字量了出来。
+**已知短板（实测，不是推测）**：`topic` 类 `R@5` 只有 0.674，仍有三分之一主题问题凑不齐前 5 位。精排能补一部分排序，但补不了召回——评测中曾有 10/24 篇标准答案落在前 50 名之外，那种缺口任何重排都救不了，只能靠新增召回信号（标题通道就是这么加上去的）。
 
 **换模型必须带 `--reindex`**：`replace` 只删当前模型名下的块，旧模型的向量不会被任何写入路径带走，会永久留在表里（覆盖率虚高、存储白占）。`--reindex` 会先调 `purge_stale_models` 清掉并打印数量。
 
@@ -492,22 +506,48 @@ curl "localhost:8000/api/v1/documents?q=乌兰察布的数据中心&mode=hybrid"
 
 ```bash
 python scripts/eval_retrieval.py                              # 三种模式全跑
-python scripts/eval_retrieval.py --mode hybrid --no-doc-agg    # 关掉第三路做 A/B
+python scripts/eval_retrieval.py --mode hybrid --no-doc-agg    # 关掉聚合路做 A/B
+python scripts/eval_retrieval.py --mode hybrid --no-rerank     # 关掉重排做 A/B
 python scripts/eval_retrieval.py --verbose                     # 看未命中明细
 ```
 
 | 模式 | R@5 | R@10 | MRR | nDCG@5 |
 |---|---|---|---|---|
 | keyword | 0.460 | 0.550 | 0.444 | 0.426 |
-| vector | 0.699 | 0.742 | 0.723 | 0.668 |
-| **hybrid** | **0.767** | **0.826** | **0.789** | **0.739** |
+| vector | 0.788 | 0.826 | 0.804 | 0.750 |
+| **hybrid** | **0.820** | **0.820** | **0.871** | **0.814** |
 
-分类型看，`hybrid` 在 `fact` 上 `R@10` 到 1.000、`named` 0.833、`en` 0.744，短板只剩 `topic` 的 `R@5 = 0.583`——四成主题类问题在前 5 条里凑不齐正确答案，这一档需要 cross-encoder 精排，尚未接入。
+分类型看，`hybrid` 在 `fact` 上全项 1.000、`named` 0.833、`en` 0.744，最弱的一档是 `topic` 的 `R@5 = 0.674`——主题类问题仍有三分之一凑不齐前 5 位。
 
-这套评测量出并修掉了两个真问题：
+这套评测量出并修掉了三个真问题：
 
 1. **keyword 对自然语言问句是结构性失效**（`R@5` 只有 0.100）。根因是整句 `ILIKE '%一句话%'`——14 个字的问句不可能整体出现在标题里，注定 0 结果，与"正文没索引"无关。加上片段兜底（中文二元组均匀采样 + 命中数阈值）后升到 0.460。
 2. **单块信号对主题型是噪声**（`topic` 只有 0.465，而 `fact` 有 0.923）。补一路"文档级前 3 块平均距离"信号参与 RRF，`topic R@10` 从 0.583 到 0.694。
+3. **召回缺口靠标题通道补，不靠精排**。诊断发现 `topic` 类 24 篇标准答案里 10 篇（42%）根本不在前 50 名内——这种缺口重排完全救不了。给每篇文档的标题+摘要单独建一条向量块（`chunk_index = -1`）后，池外从 10 篇降到 3 篇。
+
+## 精排（cross-encoder）
+
+召回用的是双塔模型：文档在入库时就被压成向量，之后再也看不到 query。384 个浮点数装不下"这句话到底在问什么"，实测里前 3 名相似度只差 0.008。精排换成 `bge-reranker-base` 的 int8 ONNX（266 MB），把 query 和候选拼成 `<s> query </s></s> passage </s>` 送进同一注意力窗口，直接输出相关性分数。
+
+```bash
+python scripts/fetch_reranker.py    # 266 MB，走国内镜像
+curl "localhost:8000/api/v1/documents?q=开源对一个国家意味着什么&mode=hybrid"
+# meta.reranked = true，每条的 match.rerank_score 是原始 logit
+```
+
+**关键设计：重排结果作为第五路参与 RRF，不直接接管排序。** 这一点是踩坑换来的——让重排直接覆盖顺序时，原本排第 1–3 的正确答案被压到 6–11 名（`t06` 1→9、`t09` 2→10、`t03` 3→11），`topic R@5` 从 0.625 掉到 0.528。原因是单个片段的证据不足以判断"整篇在讲什么"，而它一旦判错就全错。改成 5 路投票后判错会被其他 4 路投回来：
+
+| 版本 | R@5 | R@10 | MRR | nDCG@5 |
+|---|---|---|---|---|
+| 两路（keyword + 单块向量） | 0.767 | 0.767 | 0.789 | 0.739 |
+| 三路（+ 文档聚合） | 0.767 | 0.826 | 0.789 | 0.739 |
+| 四路（+ 标题摘要） | 0.805 | 0.820 | 0.856 | 0.794 |
+| 五路（+ 重排**接管**排序） | 0.776 | 0.820 | 0.849 | 0.776 |
+| 五路（+ 重排**投票**） | **0.820** | **0.820** | **0.871** | **0.814** |
+
+**喂给模型的文本是三段拼接：标题 + 摘要 + 命中块原文。** 少一段就掉一类查询：只用标题+摘要，`fact R@5` 从 1.000 掉到 0.923（答案那个数字在正文深处，摘要里没有）；只用标题+命中片段，`topic R@5` 从 0.625 掉到 0.507（片段是"某一处提到"，丢了整体主题）。
+
+命中块原文不需要额外存储：`documents.content_text` 本来就在库里，块的位置 `char_start` 也在，按字符区间切出来就是它。`document_chunks` 不存原文是为了不重复存同一份正文，不是拿不到。
 
 **评测集的边界要说清楚**：ground truth 是从标题筛出来再人工复核的，没做 pooling（把各系统 top-10 取并集再人工判定），所以漏标的正确答案会被算成"未命中"。这些数字**用于比较同一系统不同版本是可靠的，不能当绝对水平引用**。
 
@@ -564,6 +604,15 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
 - 主题分类目前是确定性关键词规则，存在少量误判（如"标准版"命中政策类）；后续阶段引入模型分类与人工校正。
 - 关键词检索为 `ILIKE`（标题 + 摘要）；正文层的召回由向量检索补上（`mode=vector|hybrid`，
   见「向量化检索」）。中文分词仍未做，`tsvector` 只用了 `simple` 配置。
+- **精排喂给模型的是「标题 + 摘要 + 命中块原文」，不是完整正文**。命中块按 `char_start`
+  从 `content_text` 切出 260 字，摘要 140 字——受 512 token 限制。主题类查询若答案分散在
+  全文各处，这一段可能不足以让模型判对。要根本解决只能提高上下文长度（换更大的
+  cross-encoder）或改成多块分别打分再聚合，两者都超出当前 CPU 预算。
+- **评测集没有做 pooling**，绝对值不能当基准引用：漏标的正确答案会被算成未命中，
+  所以真实 Recall 只会比这里更高。它适合比较版本之间的差异，不适合对外宣称"召回率 82%"。
+- 评测语料只覆盖两个真正可索引的源（阮一峰 390 篇全文 + HN 347 篇 600 字片段）。
+  HN 那批文档只有两块，`DOC_AGG_TOP_N=3` 等于全取，聚合信号在英文侧会退化成整体平均，
+  这也是 `en MRR` 在加聚合路后掉 0.056 的原因。
 - **中文线里只有阮一峰能存全文**（CC BY-NC-ND 3.0，390 篇、均值 6143 字）。36氪 走
   `rights_mode=metadata_excerpt`，正文只用于算 SimHash 指纹、不进 `content_text`；InfoQ 中文
   与少数派只授权了 RSS 摘要，所以进了 `NO_FETCH_SOURCES`。InfoQ 英文 `405`、OpenAI `403`

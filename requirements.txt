@@ -31,13 +31,15 @@ MarkupSafe==3.0.4
 mypy==2.4.1
 mypy_extensions==1.2.0
 onnxruntime>=1.20
-# 本地向量化（阶段 4）。不装也能跑：关键词检索照常，向量检索会明确返回 503，
-# 不会静默降级成假向量。版本用区间而非精确 pin——精确 pin 必须由真实安装后
-# 的 pip freeze 产出，凭记忆写死一个数字只会让别人的环境装不上。
+# 本地向量化 + 重排（阶段 5）。不装也能跑：关键词检索照常，向量检索和重排
+# 会明确返回 503，不会静默降级成假向量。版本用区间而非精确 pin——精确 pin
+# 必须由真实安装后的 pip freeze 产出，凭记忆写死一个数字只会让别人的环境装不上。
 # 实测可用组合：onnxruntime 1.32.0 + tokenizers 0.23.3 + numpy 2.5.5（Windows / cp313）。
 # 装 tokenizers 时它会拖 huggingface-hub 一整条依赖链（fsspec / pyyaml / hf-xet / httpx2），
 # 在慢网下很容易超时回滚。我们只用 Tokenizer.from_file() 读本地 tokenizer.json，
 # 不需要 hub，所以 `pip install --no-deps tokenizers` 是安全且更快的装法。
+# 注意：cross-encoder 用的是同一套 onnxruntime + tokenizers，不需要 torch——
+# bge-reranker-base 的 int8 ONNX 只有 266 MB，torch 版要多装 2 GB。
 opentelemetry-api==1.45.2
 packaging==26.3
 pathspec==1.1.1

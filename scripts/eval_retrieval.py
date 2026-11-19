@@ -119,11 +119,13 @@ def ndcg_at(ranked: list, truth: set, k: int) -> float:
     return dcg / ideal if ideal else 0.0
 
 
-async def run_mode(session, questions: list[dict], truth: dict, mode: str) -> list[dict]:
+async def run_mode(
+    session, questions: list[dict], truth: dict, mode: str, rerank: bool | None = None
+) -> list[dict]:
     results = []
     for question in questions:
         page = await document_service.list_documents(
-            session, q=question["q"], limit=TOP_K, search_mode=mode
+            session, q=question["q"], limit=TOP_K, search_mode=mode, rerank=rerank
         )
         ranked = [document.id for document, _ in page.items]
         expected = truth[question["id"]]
@@ -203,6 +205,11 @@ async def main(args) -> int:
     questions = payload["questions"]
     modes = args.mode or list(MODES)
 
+    # argparse 的两个开关合成服务层的三态参数
+    args.rerank = True if args.require_rerank else (False if args.no_rerank else None)
+    if args.rerank is not None:
+        print(f"（rerank={'强制开启' if args.rerank else '关闭'}）\n")
+
     if args.no_doc_agg:
         # 关掉第三路信号，用来回答「这个提升到底是不是聚合带来的」。
         # 直接在模块上替换，不动生产代码——评测脚本不应该为了做对照
@@ -224,7 +231,9 @@ async def main(args) -> int:
 
         all_results = {}
         for mode in modes:
-            all_results[mode] = await run_mode(session, questions, truth, mode)
+            all_results[mode] = await run_mode(
+                session, questions, truth, mode, rerank=args.rerank
+            )
 
     print(f"\n评测集：{len(questions)} 题 | TOP_K={TOP_K} | 库内文档 "
           f"{(await _doc_count())} 篇\n")
@@ -255,6 +264,16 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="打印未命中题目的明细")
     parser.add_argument(
         "--no-doc-agg", action="store_true", help="关闭文档级聚合信号，用于对照实验"
+    )
+    # 三态：不传=跟随配置（有模型就重排），--no-rerank=强制不重排（对照组），
+    # --require-rerank=强制重排（模型缺失会直接失败，用来确认评测真的用上了模型）
+    parser.add_argument(
+        "--no-rerank", action="store_true", help="不重排，作为 cross-encoder 的对照组"
+    )
+    parser.add_argument(
+        "--require-rerank",
+        action="store_true",
+        help="强制要求重排，模型缺失时直接报错而不是静默跳过",
     )
     parser.add_argument("--save", help="把结果存成 JSON，便于跨版本对比")
     sys.exit(asyncio.run(main(parser.parse_args())))

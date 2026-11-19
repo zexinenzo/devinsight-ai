@@ -32,17 +32,30 @@ def request_id_of(request: Request) -> str:
     return getattr(request.state, "request_id", "-")
 
 
-def envelope(request: Request, data: Any, *, total: int | None = None, next_cursor: str | None = None) -> dict:
-    return {
-        "data": data,
-        "meta": {
-            "request_id": request_id_of(request),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "total": total,
-            "next_cursor": next_cursor,
-        },
-        "error": None,
+def envelope(
+    request: Request,
+    data: Any,
+    *,
+    total: int | None = None,
+    next_cursor: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """统一响应外壳。
+
+    `extra` 只在使用它的端点上出现，不写成固定字段：语义检索要报告
+    `reranked`（这次结果有没有经过 cross-encoder 精排），关键词检索没有这个概念，
+    给它一个恒为 False 的字段只会让人误以为「本来该重排却没排」。
+    """
+
+    meta: dict[str, Any] = {
+        "request_id": request_id_of(request),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total": total,
+        "next_cursor": next_cursor,
     }
+    if extra:
+        meta.update(extra)
+    return {"data": data, "meta": meta, "error": None}
 
 
 class ORMModel(BaseModel):

@@ -64,6 +64,17 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 384
     # 留空则用 ~/.cache/devinsight/models/<模型名>，模型文件不进仓库
     embedding_model_dir: str = ""
+    # 重排（cross-encoder）。把 query 和候选文档拼成一条句子送进模型，
+    # 直接输出相关性分数——它能看到 query，所以比向量点积准得多，
+    # 代价是不能预计算：每篇候选每次查询都要过一遍模型。
+    #
+    # onnx = 本地 ONNX 推理；disabled = 不重排，直接用 RRF 顺序。
+    rerank_backend: str = "onnx"
+    rerank_model: str = "Xenova/bge-reranker-base"
+    rerank_model_dir: str = ""
+    # 只重排前多少条候选。40 条 × 约 25ms ≈ 1 秒，这是「值得为一个查询多等一秒」
+    # 的量级上限；再往上加，用户感知到的是延迟而不是准确率。
+    rerank_candidates: int = 40
     web_search_provider: str = ""
     web_search_api_key: str = ""
     github_token: str = ""

@@ -34,6 +34,9 @@ class DocumentMatch(BaseModel):
     similarity: float | None = None
     # 最佳命中块在原文字符串里的起点，前端可渲染成「命中在第 1200 字附近」
     char_start: int | None = None
+    # cross-encoder 重排给的原始 logit，越大越相关。
+    # 只用于解释排序，不要当概率：int8 量化会改变它的绝对量级，跨模型不可比。
+    rerank_score: float | None = None
 
 
 class DocumentListItem(ORMModel):

@@ -30,6 +30,18 @@ logger = get_logger(__name__)
 # 32 块在 e5-small 上大约 200~400ms，是「值得丢进线程」的量级。
 EMBED_BATCH = 32
 
+# 标题摘要块用固定下标 -1，与正文块（0, 1, 2 ...）区分开。
+#
+# 它解决的是一个切块本身无法解决的问题：一篇 9000 字周刊切成 20 多块之后，
+# **每一块都在讲一件小事**，没有任何一块代表「这期整体在讲什么」。主题型提问
+# （「开源对一个国家意味着什么」）要的恰恰是后者，于是它在单块信号里必然吃亏。
+# 标题和摘要才是这个信息唯一的载体，所以单独给它一条向量。
+HEADER_CHUNK_INDEX = -1
+
+# 标题摘要块的文本上限。摘要本身可能很长，但标题在前、信息密度最高，
+# 截到 400 字既覆盖了摘要的主干，又与正文块的长度量级一致。
+HEADER_MAX_CHARS = 400
+
 _INSERT_SQL = text(
     """
     INSERT INTO document_chunks
@@ -129,6 +141,120 @@ async def index_documents(
 
     counters["chunks"] = len(rows)
     logger.info("vector_index_done", extra={**counters, "model": model_name})
+    return counters
+
+
+def build_header_text(title: str | None, summary: str | None) -> str:
+    """把标题和摘要拼成一条待向量的文本。
+
+    标题永远保留（最长 200 字），摘要按剩余预算截断。摘要为空时只索引标题——
+    这仍然有价值：标题往往就是主题最浓缩的表达。
+    """
+
+    head = (title or "").strip()
+    tail = " ".join((summary or "").split())
+    if not head:
+        # 没有标题时直接返回摘要。写成 f"{head}\n{tail}" 会留下一个前导换行，
+        # 虽然向量模型基本不受影响，但这条文本会被切块测试和人工排查看到
+        return tail[:HEADER_MAX_CHARS]
+    if not tail:
+        return head[:HEADER_MAX_CHARS]
+    budget = HEADER_MAX_CHARS - len(head) - 1
+    if budget < 40:
+        # 标题本身已经吃掉了预算，摘要加进去只会把标题挤掉——标题更重要
+        return head[:HEADER_MAX_CHARS]
+    return f"{head}\n{tail[:budget]}"
+
+
+async def index_document_headers(
+    session: AsyncSession,
+    *,
+    limit: int | None = None,
+    only_missing: bool = True,
+) -> dict[str, int]:
+    """给每篇文档的「标题 + 摘要」建一条独立向量块（`chunk_index = -1`）。
+
+    与 `index_from_stored_content` 的区别在于**它不需要正文**：正文只有 600 字
+    片段（`metadata_excerpt` 源）的文档，标题摘要照样完整，所以这条路径能覆盖
+    到向量检索此前完全够不着的那批文档。
+
+    成本也低得多：每篇文档一条，737 篇约 4 秒，而正文索引要 20 多分钟。
+    """
+
+    counters = {"documents": 0, "chunks": 0, "skipped_short": 0}
+    embedder = embedding_service.get_embedder()
+    model_name = embedder.name
+
+    where_missing = ""
+    if only_missing:
+        where_missing = """
+            AND NOT EXISTS (
+                SELECT 1 FROM document_chunks c
+                 WHERE c.document_id = d.id
+                   AND c.model = :model
+                   AND c.chunk_index = :header_index
+            )
+        """
+
+    rows = (
+        await session.execute(
+            text(
+                f"""
+                SELECT d.id, d.title, d.summary
+                  FROM documents d
+                 WHERE (d.title IS NOT NULL OR d.summary IS NOT NULL)
+                   {where_missing}
+                 ORDER BY d.fetched_at DESC
+                 {"LIMIT :limit" if limit else ""}
+                """
+            ),
+            {
+                "model": model_name,
+                "header_index": HEADER_CHUNK_INDEX,
+                **({"limit": limit} if limit else {}),
+            },
+        )
+    ).all()
+    if not rows:
+        return counters
+
+    payload: list[tuple[uuid.UUID, str]] = []
+    for document_id, title, summary in rows:
+        header = build_header_text(title, summary)
+        if not header:
+            counters["skipped_short"] += 1
+            continue
+        payload.append((document_id, header))
+
+    if not payload:
+        return counters
+
+    vectors: list[list[float]] = []
+    for offset in range(0, len(payload), EMBED_BATCH):
+        batch = [header for _, header in payload[offset : offset + EMBED_BATCH]]
+        vectors.extend(await asyncio.to_thread(embedder.embed_passages, batch))
+
+    if len(vectors) != len(payload):
+        raise RuntimeError(
+            f"向量数量与标题块数不一致：{len(vectors)} != {len(payload)}，拒绝写入错位的索引"
+        )
+
+    records = [
+        {
+            "document_id": document_id,
+            "chunk_index": HEADER_CHUNK_INDEX,
+            "char_start": 0,
+            "char_end": len(header),
+            "embedding": embedding_service.to_vector_literal(vectors[position]),
+            "model": model_name,
+        }
+        for position, (document_id, header) in enumerate(payload)
+    ]
+    await session.execute(_INSERT_SQL, records)
+
+    counters["documents"] = len(records)
+    counters["chunks"] = len(records)
+    logger.info("vector_header_index_done", extra={**counters, "model": model_name})
     return counters
 
 

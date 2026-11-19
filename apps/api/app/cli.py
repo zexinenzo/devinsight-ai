@@ -196,11 +196,13 @@ async def _dedup(days: int, threshold: int, event_threshold: float) -> int:
     return 0
 
 
-async def _embed(limit: int, reindex: bool) -> int:
+async def _embed(limit: int, reindex: bool, headers_only: bool = False) -> int:
     """用已入库正文补向量索引，并报告覆盖情况。"""
 
     stale: dict[str, int] = {}
     model_name = ""
+    stats: dict[str, int] = {"documents": 0, "chunks": 0, "skipped_short": 0}
+    header_stats: dict[str, int] = {"documents": 0, "chunks": 0, "skipped_short": 0}
     try:
         async with session_scope() as session:
             model_name = embedding_service.get_embedder().name
@@ -210,8 +212,15 @@ async def _embed(limit: int, reindex: bool) -> int:
                 stale = await vector_index_service.purge_stale_models(
                     session, keep_model=model_name
                 )
-            stats = await vector_index_service.index_from_stored_content(
-                session, limit=limit, only_missing=not reindex
+            if not headers_only:
+                stats = await vector_index_service.index_from_stored_content(
+                    session, limit=limit, only_missing=not reindex
+                )
+            # 标题摘要块每篇一条，737 篇约 4 秒，成本可以忽略，所以默认一起建。
+            # 它覆盖的是正文索引够不着的部分：正文只有 600 字片段的文档，
+            # 标题摘要照样完整。
+            header_stats = await vector_index_service.index_document_headers(
+                session, only_missing=not reindex
             )
             coverage = await _embedding_coverage(session)
     except EmbeddingUnavailable as error:
@@ -222,13 +231,16 @@ async def _embed(limit: int, reindex: bool) -> int:
     if stale:
         detail = "、".join(f"{name}={count} 块" for name, count in stale.items())
         print(f"清理旧向量：{detail}（不属于当前模型 {model_name}，向量空间不同不能混用）")
-    print(
-        f"向量索引：文档={stats['documents']} 块={stats['chunks']} "
-        f"太短跳过={stats['skipped_short']}"
-    )
+    if not headers_only:
+        print(
+            f"向量索引：文档={stats['documents']} 块={stats['chunks']} "
+            f"太短跳过={stats['skipped_short']}"
+        )
+    print(f"标题摘要索引：新增={header_stats['documents']} 块 无标题跳过={header_stats['skipped_short']}")
     print(
         f"覆盖情况：可索引文档={coverage['eligible']} 已建索引={coverage['indexed']} "
-        f"（{coverage['ratio']:.1%}）其中仅片段={coverage['excerpt_only']}，库里块数={coverage['chunks']}"
+        f"（{coverage['ratio']:.1%}）其中仅片段={coverage['excerpt_only']}，"
+        f"正文块={coverage['chunks']} 标题块={coverage['header_chunks']}"
     )
     if coverage["eligible"] > coverage["indexed"]:
         print("提示：还有文档没索引，跑 python -m app.cli embed --limit 500 继续")
@@ -253,6 +265,10 @@ async def _embedding_coverage(session) -> dict:
 
     所有 `EXISTS` 都带 `c.model = :model`。不带的话，换模型时旧模型的块会让覆盖率
     显示成 100%，而检索实际上一条都命中不了——统计口径和检索口径必须一致。
+
+    同样必须带 `c.chunk_index >= 0`：标题摘要块（`-1`）每篇都有一条，不带这个条件的话
+    一篇正文没索引、只有标题块的文档也会被算成「已索引」，覆盖率照样虚高。
+    这是同一个坑的第二次：**统计口径漏一个条件，指标就会骗自己**。
     """
 
     model_name = embedding_service.get_embedder().name
@@ -267,6 +283,7 @@ async def _embedding_coverage(session) -> dict:
                           AND EXISTS (
                               SELECT 1 FROM document_chunks c
                                WHERE c.document_id = d.id AND c.model = :model
+                                 AND c.chunk_index >= 0
                           )
                     ) AS indexed,
                     count(*) FILTER (
@@ -275,6 +292,7 @@ async def _embedding_coverage(session) -> dict:
                           AND EXISTS (
                               SELECT 1 FROM document_chunks c
                                WHERE c.document_id = d.id AND c.model = :model
+                                 AND c.chunk_index >= 0
                           )
                     ) AS excerpt_only
                   FROM documents d
@@ -289,17 +307,26 @@ async def _embedding_coverage(session) -> dict:
     ).one()
     chunks = (
         await session.execute(
-            text("SELECT count(*) FROM document_chunks WHERE model = :model"),
-            {"model": model_name},
+            text(
+                """
+                SELECT
+                    count(*) FILTER (WHERE chunk_index >= 0) AS body_chunks,
+                    count(*) FILTER (WHERE chunk_index = :header_index) AS header_chunks
+                  FROM document_chunks
+                 WHERE model = :model
+                """
+            ),
+            {"model": model_name, "header_index": vector_index_service.HEADER_CHUNK_INDEX},
         )
-    ).scalar_one()
+    ).one()
     eligible, indexed, excerpt_only = int(row[0]), int(row[1]), int(row[2])
     return {
         "eligible": eligible,
         "indexed": indexed,
         "excerpt_only": excerpt_only,
         "ratio": (indexed / eligible) if eligible else 0.0,
-        "chunks": int(chunks),
+        "chunks": int(chunks[0]),
+        "header_chunks": int(chunks[1]),
     }
 
 
@@ -366,6 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="连已有索引的文档一起重算（换模型后必须跑）",
     )
+    embed_parser.add_argument(
+        "--headers-only",
+        action="store_true",
+        help="只建标题摘要块（每篇一条，几秒钟），不碰正文块",
+    )
     return parser
 
 
@@ -392,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "refingerprint":
                 return await _refingerprint(args.all_sources)
             if args.command == "embed":
-                return await _embed(args.limit, args.reindex)
+                return await _embed(args.limit, args.reindex, args.headers_only)
             return 2
         finally:
             await dispose_engine()

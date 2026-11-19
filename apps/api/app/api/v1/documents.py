@@ -85,6 +85,14 @@ async def list_documents(
             "能命中摘要之外的内容，但只有第一页；hybrid 把两者按名次融合"
         ),
     ),
+    rerank: bool | None = Query(
+        None,
+        description=(
+            "是否用 cross-encoder 精排前 40 条候选。不传则跟随配置（有模型就排）；"
+            "true 表示必须重排，模型缺失返回 503；false 表示不重排。"
+            "meta.reranked 会如实反映这次结果有没有排过"
+        ),
+    ),
 ):
     page = await document_service.list_documents(
         session,
@@ -101,6 +109,7 @@ async def list_documents(
         sort=sort,
         include_reposts=include_reposts,
         search_mode=mode,
+        rerank=rerank,
     )
     items = [
         to_list_item(
@@ -111,7 +120,12 @@ async def list_documents(
         ).model_dump(mode="json")
         for document, src in page.items
     ]
-    return envelope(request, items, total=page.total, next_cursor=page.next_cursor)
+    # 只有语义检索才有「重排过没有」这件事；关键词模式给一个恒为 False 的字段
+    # 会让人误以为「本该重排却没排」
+    extra = {"reranked": page.reranked} if mode in ("vector", "hybrid") else None
+    return envelope(
+        request, items, total=page.total, next_cursor=page.next_cursor, extra=extra
+    )
 
 
 def _to_schema_match(match: document_service.MatchInfo | None) -> DocumentMatch | None:
@@ -120,10 +134,14 @@ def _to_schema_match(match: document_service.MatchInfo | None) -> DocumentMatch 
     两个 dataclass 字段几乎一样，但仍然分成两层：服务层不该依赖 HTTP 层的
     Pydantic 模型，否则以后改响应字段会牵动检索逻辑。
     """
-
     if match is None:
         return None
-    return DocumentMatch(mode=match.mode, similarity=match.similarity, char_start=match.char_start)
+    return DocumentMatch(
+        mode=match.mode,
+        similarity=match.similarity,
+        char_start=match.char_start,
+        rerank_score=match.rerank_score,
+    )
 
 
 @router.get("/documents/{document_id}", summary="文档详情")
