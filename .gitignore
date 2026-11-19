@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# 临时验证脚本：一次性的端到端跑数，跑完就该丢，不入库
+.tmp/
 
 # Node
 node_modules/

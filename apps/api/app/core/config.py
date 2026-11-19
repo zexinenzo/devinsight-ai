@@ -75,8 +75,26 @@ class Settings(BaseSettings):
     # 只重排前多少条候选。40 条 × 约 25ms ≈ 1 秒，这是「值得为一个查询多等一秒」
     # 的量级上限；再往上加，用户感知到的是延迟而不是准确率。
     rerank_candidates: int = 40
+    # --- 实时搜索（阶段 5）---
+    # provider 留空 = 能力关闭，/evidence 只返回本地证据，不报错；
+    # 调用方显式要求 include_web 时才 503（与 rerank 同一套「缺能力要明说」的约定）。
+    #
+    # tavily_keyless = 不带 key、加 X-Tavily-Access-Mode: keyless 头，约 30 次/天
+    # （上游 429 的错误码是 daily_cap_reached，是每日不是每小时）。
+    # 它的响应 schema 与带 key 完全相同，所以「先用 keyless 跑通、后面有 key 直接换」
+    # 不需要改任何解析代码——这条是实测确认过的，不是文档抄的。
     web_search_provider: str = ""
     web_search_api_key: str = ""
+    web_search_base_url: str = "https://api.tavily.com"
+    web_search_keyless: bool = True
+    # news 模式才返回 published_date。general 模式按相关性排，实测会把 2023 年的
+    # 旧闻排到第一——所以默认走 news，拿日期比拿覆盖面重要。
+    web_search_topic: str = "news"
+    # 时间窗（天）。news 模式下这是硬过滤；超出 1~30 会被服务端拒绝。
+    web_search_days: int = 7
+    # 一次给 Agent 的证据条数上限。不是越大越好：N 条 web 结果意味着 N 个
+    # 待验证的域名，而模型能可靠引用的通常不到 10 条。
+    web_search_max_results: int = 8
     github_token: str = ""
     huggingface_token: str = ""
 

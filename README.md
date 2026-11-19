@@ -3,8 +3,10 @@
 科技产业情报平台：从中国与全球公开、合规的数据源持续采集科技新闻、官方发布、开源动态与论文，
 把原始信息转化为可检索、可追溯的情报。
 
-当前进度：**阶段 0（工程骨架）+ 阶段 1（来源注册与 RSS）+ 阶段 2（多源 API）+ 阶段 3（正文补全与去重）**
-已跑通，即手册 14.1 要求的「第一条真实数据闭环」：
+当前进度：**阶段 0–5 已跑通**——工程骨架 / 来源注册与 RSS / 多源 API /
+正文补全与去重 / 向量化检索与精排 / 实时搜索。每个阶段都有实测记录，
+指标与边界都写在对应章节里，没有实测支撑的说法一律标注为「未验证」。
+手册 14.1 要求的「第一条真实数据闭环」在阶段 3 已达成：
 
 ```
 11 个启用源（6 RSS + HN + 3 GitHub 仓库 + arXiv）
@@ -12,6 +14,7 @@
   -> PostgreSQL documents（幂等入库）
   -> engagement 回填热度 -> enrich 按热度抓正文 + SimHash -> dedup 判转载 / 聚事件
   -> FastAPI GET /api/v1/documents（支持 sort=engagement）
+  -> FastAPI GET /api/v1/evidence（本地证据 + 实时证据 + 可信度画像）
   -> Next.js /intelligence 情报流（按时间 / 按热度、事件簇、抓取状态）
 ```
 
@@ -85,6 +88,7 @@ make beat          # 见下方「自动跑的三件事」
 | POST | `/api/v1/admin/sources/{id}/sync` | 手动触发同步（优先入 Celery，broker 不可用则进程内执行） |
 | GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/sort/limit/cursor/mode/rerank` |
 | GET | `/api/v1/documents/{id}` | 文档详情 |
+| GET | `/api/v1/evidence` | 证据集：`q/days/local_limit/web_limit/include_web/mode`，返回本地 + 实时证据与 `verification` 画像 |
 | GET | `/api/v1/meta/topics` | 六大领域字典 |
 | GET | `/api/v1/meta/content-types` | 内容类型分布（只列库里真实存在的类型，带条数） |
 | GET | `/api/v1/stats` | 总览统计（按来源/地区/领域） |
@@ -511,6 +515,14 @@ python scripts/eval_retrieval.py --mode hybrid --no-rerank     # 关掉重排做
 python scripts/eval_retrieval.py --verbose                     # 看未命中明细
 ```
 
+实时搜索的价值用另一套指标量（答案每天变，R@5 不适用）：
+
+```bash
+python scripts/eval_evidence.py --local-profile   # 本地时效画像，不联网
+python scripts/eval_evidence.py --lang zh         # 只跑中文问题（消耗额度）
+python scripts/eval_evidence.py --replay          # 回放录制响应，不消耗额度
+```
+
 | 模式 | R@5 | R@10 | MRR | nDCG@5 |
 |---|---|---|---|---|
 | keyword | 0.460 | 0.550 | 0.444 | 0.426 |
@@ -550,6 +562,137 @@ curl "localhost:8000/api/v1/documents?q=开源对一个国家意味着什么&mod
 命中块原文不需要额外存储：`documents.content_text` 本来就在库里，块的位置 `char_start` 也在，按字符区间切出来就是它。`document_chunks` 不存原文是为了不重复存同一份正文，不是拿不到。
 
 **评测集的边界要说清楚**：ground truth 是从标题筛出来再人工复核的，没做 pooling（把各系统 top-10 取并集再人工判定），所以漏标的正确答案会被算成"未命中"。这些数字**用于比较同一系统不同版本是可靠的，不能当绝对水平引用**。
+
+## 实时搜索（阶段 5）
+
+### 问题：本地库能答「库里有什么」，答不了「今天有什么」
+
+阶段 4 解决的是「正文里的字搜不到」，但另一条边界一直在：**库里只有采集过的源**。
+11 个启用源的时效画像（`python scripts/eval_evidence.py --local-profile`，不联网）：
+
+```
+source                     tier  docs  last7     newest
+hackernews_en              C      655    655         0d
+36kr_zh                    B       30     30         0d
+sspai_zh                   B       10     10         0d
+infoq_en                   B       16     16         0d
+infoq_zh                   B       20     20        -1d
+openai_news_en             A      200     23         1d
+arxiv_cs_ai                B       50     50         1d
+github_release_vllm        A       20      1         2d
+github_release_transformers A      20      1         5d
+ruanyifeng_zh              A      390      1         6d
+github_release_ollama      A       20      0         8d
+```
+
+看起来不差——只有 1 个源超过 7 天。但把中英分开，真正的差距出来了：
+
+| | 存量 | 最近 7 天 | 占比变化 |
+|---|---|---|---|
+| 中文 | 450（31.4%） | 61（7.6%） | **降到四分之一** |
+| 英文 | 981 | 746 | 升到 64% |
+
+中文占存量的三成，却只占增量的不到一成。**不是没覆盖，是在变旧**——4 个中文源
+里 390 条来自每周一篇的周刊，36氪 的 30 条是最近才开始采的。同一批时效性问题，
+本地能给的最新证据：
+
+| 查询 | 本地最新命中 | web |
+|---|---|---|
+| `OpenAI latest model release` | 0 天 | 1 天 |
+| `大模型 发布` | 90 天 | 有窗口内结果 |
+| `开源模型 更新` | 110 天 | 同上 |
+| `AI 监管 政策` | 110 天 | 同上 |
+| `芯片 出口 限制` | 171 天 | 同上 |
+
+英文侧本地已经是当天（HN 每天几十条），中文侧是三个月到半年。排序再准也变不出
+没入库的语料——这是阶段 5 存在的唯一理由。
+
+### 三个「搜索 API 不可信」的具体形态
+
+**1. 默认不给你时间。** `topic=general` 的响应里没有任何日期字段。同一句 query，
+分数最高（0.79）的一条是 2023 年 GPT-4 开放 API 的旧闻——它确实相关，但拿它回答
+「最新进展」就是错的，而且从响应里看不出它有多旧。`topic=news` + `days=7` 才带
+`published_date`，且真的按窗口过滤（实测返回全部落在 3 天内）。所以默认走 news：
+**拿得到日期比拿得到覆盖面重要**。
+
+**2. 官方域名下有用户空间。** 实测结果里有一条 `community.openai.com`，标题写着
+「GPT-6.2 Astra and Sol are now available - Announcements」。按域名后缀匹配它会命中
+`openai.com` 被判成一手源，但它其实是用户论坛。拦截规则必须在大类匹配**之前**：
+
+```python
+_UGC_SUBDOMAIN_PREFIXES = ("community.", "forum.", "discuss.", "bbs.", "club.", "support.")
+```
+
+**3. 聚合站会转载一手稿。** 同一次搜索里，`finance.yahoo.com` 那条的内容来自
+Reuters。按域名它是 C 档聚合站，按内容它是一手通讯社的报道。域名分级只能反映
+「这个站点自己有没有采编能力」，不能反映「这一条的具体来源」——所以 `tier` 只用于
+排序和展示，**响应里永远不出现「已核实」**。
+
+### 不按混合分排序
+
+本地分数是余弦相似度，web 分数是上游相关性，两者不在一个量纲。强行归一化成一个
+"总分"看起来专业，实际是用未知冒充已知。这里改为显式优先级链：
+
+```python
+(date_verified, published_at, score)   # 无日期的排最后，不是按相关性往前挤
+```
+
+理由：一条不知道日期的结果无法承担「补充时效」这个用途。把它排到带日期的结果
+前面，等于用未知冒充已知。
+
+### 接口
+
+```bash
+# 完整证据集：本地 8 条 + 实时 8 条，附可信度画像
+curl "localhost:8000/api/v1/evidence?q=OpenAI%20announcement&days=7"
+
+# 只看本地（不联网，web_status=disabled）
+curl "localhost:8000/api/v1/evidence?q=大模型&include_web=false"
+```
+
+```json
+{
+  "data": {
+    "local": [{"channel": "local", "source_tier": "C", "freshness": "today", "char_start": 1215, ...}],
+    "web": [{"channel": "web", "source_tier": "A", "published_at": "2026-11-16T08:00:00Z",
+             "date_verified": true, "in_local": true, "freshness": "this_week", ...}],
+    "verification": {
+      "web_total": 3, "unique_domains": 2, "overlap_with_local": 1,
+      "date_unverified": 0, "tier_counts": {"A": 1, "C": 2}, "mean_age_days": 1.7
+    },
+    "web_status": "ok"
+  }
+}
+```
+
+`verification` 里三个数字是给程序做判断用的，不是装饰：
+
+- `unique_domains` 按**可注册域名**去重（`finance.yahoo.com` 与 `news.yahoo.com` 算一家），
+  它回答「几家在说同一件事」；
+- `overlap_with_local` 高说明所谓「新信息」大部分是已知内容被再次看到；
+- `date_unverified > 0` 时，任何「最新」措辞都该降级成「近期」。
+
+### 三种状态必须长得不一样
+
+| 情况 | HTTP | 语义 |
+|---|---|---|
+| 要求实时证据但没配 provider | 503 `web_search_unavailable` | 这个部署没联网，改配置可解 |
+| 配了但上游限流/超时/5xx | 502 `upstream_unavailable` | 上游此刻不行，等一会儿可能好 |
+| `include_web=false` | 200 + `web_status=disabled` | 本来就没要 |
+
+第一条不能返回「200 + 空 web 列表」：调用方会认为「今天全网没有相关新闻」，
+而事实是这个部署根本没联网。这两种情况的运维动作完全相反。
+
+### 诚实边界
+
+- **keyless 是每日额度，不是每小时。** 上游 429 的错误码是 `daily_cap_reached`
+  （约 30 次/天）。写文档时按第三方评测写成「每小时」，是跑出 429 才纠正过来的。
+- **中文查询的真实补全能力还没验证。** 上面的中英对照里 web 一列来自**录制响应回放**
+  （额度当天用尽），而回放不区分 query。所以「本地中文 90–171 天」是硬数据，
+  「web 能补上中文」还不是。要有 key 之后跑 `--limit 8` 才能下结论。
+- **没做事实核查。** `unique_domains` 是声源广度，不是「几家独立证实」。两个站
+  转载同一篇通稿会被算成两个声源。
+- **没做 pooling。** 评测指标用于比较同一系统的不同版本，不能当绝对水平引用。
 
 ## 环境排障：WSL 里 docker 报 `Exec format error`
 
@@ -601,6 +744,12 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
 
 ## 已知边界（后续阶段处理）
 
+- **实时搜索的 provider 是单点的**。keyless 有每日额度（约 30 次/天，429 错误码
+  `daily_cap_reached`），且能力上只有一家。没有 failover 链，也没有缓存层——
+  同一个 query 重复请求会重复消耗额度（上游即使命中它自己的缓存也照扣）。
+- **中文实时检索能力未验证**。本地库中文时效是 90–171 天（已验证），但实时搜索
+  能否补上中文，要等有 API key 后跑 live 评测；回放数据不区分 query。
+- **没做事实核查**。`unique_domains` 是声源广度，不是「N 家独立证实」。
 - 主题分类目前是确定性关键词规则，存在少量误判（如"标准版"命中政策类）；后续阶段引入模型分类与人工校正。
 - 关键词检索为 `ILIKE`（标题 + 摘要）；正文层的召回由向量检索补上（`mode=vector|hybrid`，
   见「向量化检索」）。中文分词仍未做，`tsvector` 只用了 `simple` 配置。
