@@ -3,8 +3,8 @@
 科技产业情报平台：从中国与全球公开、合规的数据源持续采集科技新闻、官方发布、开源动态与论文，
 把原始信息转化为可检索、可追溯的情报。
 
-当前进度：**阶段 0–5 已跑通**——工程骨架 / 来源注册与 RSS / 多源 API /
-正文补全与去重 / 向量化检索与精排 / 实时搜索。每个阶段都有实测记录，
+当前进度：**阶段 0–6 已跑通**——工程骨架 / 来源注册与 RSS / 多源 API /
+正文补全与去重 / 向量化检索与精排 / 实时搜索 / Agent 研究助手。每个阶段都有实测记录，
 指标与边界都写在对应章节里，没有实测支撑的说法一律标注为「未验证」。
 手册 14.1 要求的「第一条真实数据闭环」在阶段 3 已达成：
 
@@ -15,6 +15,7 @@
   -> engagement 回填热度 -> enrich 按热度抓正文 + SimHash -> dedup 判转载 / 聚事件
   -> FastAPI GET /api/v1/documents（支持 sort=engagement）
   -> FastAPI GET /api/v1/evidence（本地证据 + 实时证据 + 可信度画像）
+  -> FastAPI GET /api/v1/research（模型规划 -> 调工具 -> 带引用作答，SSE 流式）
   -> Next.js /intelligence 情报流（按时间 / 按热度、事件簇、抓取状态）
 ```
 
@@ -58,6 +59,37 @@ make worker        # Celery Worker
 make beat          # 见下方「自动跑的三件事」
 ```
 
+### 配置 Agent（阶段 6）
+
+`/api/v1/research` 需要一个 OpenAI 兼容的模型端点。**不配也能跑其余所有接口**，
+它单独返回 503——和 embedding / rerank / web_search 一样，能力缺失显式报错。
+
+```bash
+# .env
+LLM_PROVIDER=openrouter                      # 只是日志标签
+LLM_BASE_URL=https://openrouter.ai/api/v1    # 真正决定打到哪里
+LLM_API_KEY=sk-...
+LLM_MODEL=deepseek/deepseek-v4.1-flash
+```
+
+做这个分离是有原因的：如果按 `provider` 隐式映射 URL，写错 provider 名会得到一个
+连接超时，看起来像网络问题，实际是配置错了。宁可让 `base_url` 显式填。
+
+实测可用（2026-11，都是各家文档原文）：
+
+| 端点 | `LLM_BASE_URL` | 模型 |
+|---|---|---|
+| OpenRouter | `https://openrouter.ai/api/v1` | `deepseek/deepseek-v4.1-flash` |
+| 智谱 GLM（免费档） | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+| DeepSeek 官方 | `https://api.deepseek.com/v1` | `deepseek-chat` |
+
+验证一次：
+
+```bash
+curl "localhost:8000/api/v1/research/limits"       # ready=true 说明配好了
+curl -N "localhost:8000/api/v1/research?q=OpenAI%20最近发布了什么&max_turns=3"
+```
+
 ### 自动跑的四个任务
 
 只起 `worker + beat` 就够了。这几条在 `celery_app.conf.beat_schedule` 里：
@@ -89,6 +121,8 @@ make beat          # 见下方「自动跑的三件事」
 | GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/sort/limit/cursor/mode/rerank` |
 | GET | `/api/v1/documents/{id}` | 文档详情 |
 | GET | `/api/v1/evidence` | 证据集：`q/days/local_limit/web_limit/include_web/mode`，返回本地 + 实时证据与 `verification` 画像 |
+| GET | `/api/v1/research` | Agent 研究：`q/max_turns/max_tool_calls/max_web_calls/max_runtime_seconds`，SSE 返回阶段事件与带引用的答案 |
+| GET | `/api/v1/research/limits` | Agent 的四档预算与模型状态（供前端在发起前展示） |
 | GET | `/api/v1/meta/topics` | 六大领域字典 |
 | GET | `/api/v1/meta/content-types` | 内容类型分布（只列库里真实存在的类型，带条数） |
 | GET | `/api/v1/stats` | 总览统计（按来源/地区/领域） |
@@ -697,6 +731,109 @@ curl "localhost:8000/api/v1/evidence?q=大模型&include_web=false"
 完整推导见教程第 6 章：provider 契约怎么定（6.2）、为什么两边分数不能混排（6.6）、
 域名分级与事实核查的边界（6.7）、错误码为什么必须分 503 与 502（6.8）。
 
+## Agent 研究助手（阶段 6）
+
+一个问题的完整流程：
+
+```
+GET /api/v1/research?q=本周 AI 领域有什么重要发布
+  -> started        问题、模型、四档预算
+  -> turn_started   第几轮，工具是否可用
+  -> tool_call      调了 search_local / search_web，原始参数（模型生成的，可能是错的）
+  -> tool_result    是否成功、耗时、累计证据（前端按 index 合并）
+  -> answer         带 [编号] 的答案
+  -> done           证据、引用校验、轮数、耗时、收尾原因
+```
+
+### 为什么自己写循环，不用 LangGraph
+
+三个理由，按重要性排：
+
+1. **控制流要看得见。** 预算检查、工具拒绝、强制收尾，这三件事发生在循环的
+   具体位置。放进图里之后，读代码的人要先在脑子里把图展开，才能回答
+   「配额用尽时会发生什么」。而这个项目最需要的恰恰是这件事能被一眼回答。
+2. **依赖成本。** LangGraph 会带进 langchain-core 一整条链，而这里要的功能
+   只有「循环 + 工具调用 + 状态记录」，`while` 加一个列表就够。
+3. **测试要能注入。** 全套编排测试用桩 LLM 跑，23 条用例 2 秒跑完，不连模型。
+   框架抽象层越厚，这种测试越难写。
+
+### 三档预算，以及为什么是 5 轮
+
+| 项 | 默认 | 超了会怎样 |
+|---|---|---|
+| `max_agent_turns` | 5 | 最后一轮禁用工具，强制作答 |
+| `max_research_tool_calls` | 12 | 拒绝执行，把「配额用尽」作为 tool 消息回传 |
+| `max_web_search_calls` | 4 | 同上，但只拦实时搜索（它花额度） |
+| `max_agent_runtime_seconds` | 180 | 剩余调用全部拒绝，再请求一次收尾 |
+
+**拒绝也是要回传的。** 模型请求了工具，如果直接跳过，下一次请求会因为
+「assistant 请求了工具却没有结果」被上游拒掉。所以每条被拒的调用都要补一条
+`role: tool` 的消息说明原因——模型看到「配额用尽」会停下来，看到异常不会。
+
+5 轮不是拍的：一轮对应一次模型请求，而免费档实测 RPM 5。再大就会在单次研究
+内部撞 429。换付费档后调 `MAX_AGENT_TURNS` 即可。
+
+### 为什么不用流式调模型
+
+流式下 `tool_calls` 的 `arguments` 是分片下发的，要自己累积再拼 JSON。拼错的表现
+是工具参数缺字段，报错位置却在工具内部。而用户真正想看的「过程」是阶段事件
+（在查什么、拿到几条），这些由我们自己发，不依赖 token 流。所以最终答案一次性
+返回，SSE 里作为单个 `answer` 事件推出。
+
+### 引用校验：让「编证据」可被发现
+
+答案里的每个 `[n]` 都会和证据池比对，返回三个数：
+
+```json
+{"cited": [2,3,4], "unknown": [7], "coverage": 0.32, "evidence_total": 19}
+```
+
+- `unknown` 非空 = 模型引用了不存在的编号。**不静默修正**——改答案就等于掩盖错误，
+  只记日志并在 `done` 里暴露出来。
+- `coverage` 的分母是「提供过的全部证据」，不是「答案里出现的编号」（后者恒为 1）；
+  覆盖率低说明检索给的多余，或证据太长模型读不完。
+
+实测三次运行：`unknown` 全为空，`coverage` 分别 1.00 / 0.35 / 0.32。
+覆盖率差异来自查询：问题越宽（「本周有什么发布」），命中的无关周刊文章越多。
+
+### 性能：从 87 秒到 25 秒的三次修正
+
+第一版跑一个问题要 **87 秒**，其中检索占了大头。三次定位：
+
+| 问题 | 现象 | 修正 |
+|---|---|---|
+| 精排候选沿用列表页的 40 条 | 每次检索 5.8 秒，一次研究调 4 次 | Agent 传 `rerank_candidates=12` → 1.7 秒 |
+| ONNX padding 宽度按「本批最长」动态取 | **同一 query 1.6 秒，换一个 query 12 秒** | 宽度吸附到 5 个固定档位，内存规划只发生 5 次 |
+| 证据池上限 16 | 第一次检索 `limit=10` 就占掉大半，后续 `dropped: 31` | 上限提到 20，并在工具结果里说明「另有 N 条未纳入」 |
+
+第二条最值得记：ONNX Runtime 的 memory pattern 按输入 shape 缓存，shape 每次
+变一点就等于每次重新规划。**症状是「慢」，但真正的线索是「重复同一请求很快」**——
+只测一次或只测同一 query，永远发现不了。
+
+最终：3 轮 4 次工具 **17.8 秒**，4 轮 4 次工具 **24.9 秒**。
+
+### 踩到的三个真 bug（都是「单测全绿、真跑才炸」）
+
+1. **`verification.independent_sources` 不存在**，实际字段是 `unique_domains`。
+   按记忆写字段名，AttributeError 被工具层的兜底捕获成 `ok=False`，
+   编排测试全绿——因为那些测试用的是假工具，绕过了 handler 本身。
+   补了两条直接调 handler 的测试。
+2. **`max_turns or 默认值` 会把显式传入的 `0` 吞成 180 秒**。用 `is None` 判断。
+3. **`elapsed_ms` 全是 0**，因为异常路径返回的是新构造的对象。
+   修 bug 的过程中先做了「把 `content` 透到事件里」，才看见真正的错误信息。
+
+### 诚实边界
+
+- **模型只能回答证据内的问题。** 实时额度耗尽时它会说「无法回答，缺少 X」，
+  而不是编一段。这是 prompt 约束住的，不是模型自觉——实测三次都遵守。
+- **免费档 RPM 5 是硬约束。** 默认 5 轮刚好卡在边缘，并发两个研究会互相挤。
+- **`llm_*` 不配就 503，其余接口不受影响。** 和 embedding / rerank / web_search
+  一致：能力缺失显式报错，不静默降级。
+- **没有做多轮对话。** 一次研究是一个独立的问答，不保留上文。要做对话式，
+  得先解决历史裁剪——上下文一长，证据就得让位。
+
+完整推导见教程第 7 章。
+
 ## 环境排障：WSL 里 docker 报 `Exec format error`
 
 现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
@@ -760,6 +897,12 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
   从 `content_text` 切出 260 字，摘要 140 字——受 512 token 限制。主题类查询若答案分散在
   全文各处，这一段可能不足以让模型判对。要根本解决只能提高上下文长度（换更大的
   cross-encoder）或改成多块分别打分再聚合，两者都超出当前 CPU 预算。
+- **Agent 是单轮的**。一次研究是一个独立问答，不保留上文；也没有做历史裁剪，
+  所以还不支持对话式追问。
+- **Agent 的工具只有两个**（`search_local` / `search_web`）。加第三个工具要先想清楚
+  「它失败时模型怎么知道」，否则多一个工具只是多一个坏掉的输入。
+- **免费档 RPM 5 会限制并发**。两个研究同时跑就会撞 429；默认的 5 轮预算刚好卡在
+  单请求的边缘。要并发必须换付费档。
 - **评测集没有做 pooling**，绝对值不能当基准引用：漏标的正确答案会被算成未命中，
   所以真实 Recall 只会比这里更高。它适合比较版本之间的差异，不适合对外宣称"召回率 82%"。
 - 评测语料只覆盖两个真正可索引的源（阮一峰 390 篇全文 + HN 347 篇 600 字片段）。

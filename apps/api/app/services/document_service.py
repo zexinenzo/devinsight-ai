@@ -253,6 +253,9 @@ async def list_documents(
     include_reposts: bool = False,
     search_mode: str = "keyword",
     rerank: bool | None = None,
+    # 只影响精排成本：排多少条候选。列表页用默认 40，Agent 传更小的值。
+    # 不影响召回范围（召回仍然是 VECTOR_CANDIDATES），只影响「谁进前几名」。
+    rerank_candidates: int | None = None,
 ) -> DocumentPage:
     limit = max(1, min(limit, MAX_LIMIT))
 
@@ -276,6 +279,7 @@ async def list_documents(
             limit=limit,
             include_reposts=include_reposts,
             rerank=rerank,
+            rerank_candidates=rerank_candidates,
         )
 
     count_statement = _apply_filters(
@@ -736,6 +740,7 @@ async def _semantic_page(
     limit: int,
     include_reposts: bool,
     rerank: bool | None = None,
+    rerank_candidates: int | None = None,
 ) -> DocumentPage:
     """向量 / 混合检索。返回结构复用列表页，额外带上命中说明。
 
@@ -839,7 +844,15 @@ async def _semantic_page(
                 session,
                 query=query_text,
                 ordered=ordered,
-                candidates=settings.rerank_candidates,
+                # 40 是给列表页调的：网页上要挑出「最相关的 5 条」，多排一些
+                # 便宜的。但 Agent 一次只要 6 条，排 40 条要 6 秒（CPU 实测），
+                # 而它一次研究要调好几次检索，光精排就能吃掉二十秒。
+                # 调用方可以传更小的值；不传则沿用全局配置。
+                candidates=(
+                    settings.rerank_candidates
+                    if rerank_candidates is None
+                    else rerank_candidates
+                ),
                 starts=starts,
             )
             if rerank_scores:

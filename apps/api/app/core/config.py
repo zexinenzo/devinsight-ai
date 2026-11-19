@@ -48,9 +48,25 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # --- 模型与搜索 ---
+    # provider 只是日志标签，真正决定打到哪里的是 base_url。
+    # 不做「provider → URL」的隐式映射：猜错域名只会得到一个连接超时，
+    # 报错看起来像网络问题，实际是配置写错了。宁可让 base_url 显式填。
+    #
+    # 实测可用的三家（都是从各家文档抄的原文，不是拼的）：
+    #   OpenAI        https://api.openai.com/v1
+    #   DeepSeek      https://api.deepseek.com/v1
+    #   智谱 GLM      https://open.bigmodel.cn/api/paas/v4
     llm_provider: str = "openai"
+    llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_model: str = ""
+    # 单次调用超时。不复用 http_timeout_seconds（20s）：Agent 的答案是长文本，
+    # 20 秒会把「慢」误判成「挂」。但也不能超过 max_agent_runtime_seconds（180s），
+    # 否则一次调用就能吃掉整个预算。
+    llm_timeout_seconds: float = 60.0
+    # 答案长度上限。不是越大越好：答案越长，模型越容易在末尾堆砌没有证据支撑的段落，
+    # 而引用覆盖率是按整篇算的，尾部注水会直接拉低这个指标。
+    llm_max_tokens: int = 1200
     # 向量化只走本地模型：把全文发给第三方 API 做嵌入，法律性质会从「我们自己存储」
     # 变成「向第三方提供作品」，等于绕过了 rights_mode 那道闸门。
     #
@@ -115,6 +131,10 @@ class Settings(BaseSettings):
     max_research_tool_calls: int = 12
     max_web_search_calls: int = 4
     max_agent_runtime_seconds: int = 180
+    # 一次研究最多几轮「模型 → 工具 → 模型」。
+    # 默认 5 不是随手定的：一轮对应一次 LLM 请求，而免费档实测 RPM 5，
+    # 再大就会在单次研究内部撞上 429。换付费档后可以往上调。
+    max_agent_turns: int = 5
 
     @field_validator("database_url")
     @classmethod

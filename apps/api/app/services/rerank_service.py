@@ -36,6 +36,16 @@ DEFAULT_MODEL = "Xenova/bge-reranker-base"
 # 截断是必要的——一篇 9000 字周刊全塞进去会被截成一万多 token，模型直接报错。
 MAX_LENGTH = 512
 
+# padding 宽度吸附到这几个档位。
+#
+# 原来这里写的是 `width = max(len(ids))`，即「本批最长有多长就多宽」。
+# 看着省计算，实测是个陷阱：ONNX Runtime 的 memory pattern 按输入 shape 缓存，
+# 每换一个 query，最长 passage 的长度就变一点，于是几乎每次都是全新 shape，
+# 每次都要重新做一遍内存规划。同一 query 重复跑 1.6 秒，换一个 query 变 12 秒。
+# 吸附到 5 个档位后，shape 种类从「几乎无限」降到 5 种，规划只发生 5 次。
+# 代价是每批最多多算 127 个 token 的 padding，远小于省下的规划开销。
+WIDTH_BUCKETS = (128, 192, 256, 384, MAX_LENGTH)
+
 
 class RerankUnavailable(RuntimeError):
     """本地重排模型不可用。携带可执行的修复提示。"""
@@ -102,7 +112,9 @@ class OnnxCrossEncoder:
         # 一次把所有候选编码完再喂给模型，比逐条推理快得多：
         # 模型调用的固定开销（session.run 的输入拷贝、线程调度）摊薄到一批上。
         encodings = self._tokenizer.encode_batch([(query, text) for text in passages])
-        width = max(len(encoding.ids) for encoding in encodings)
+        # 吸附到固定档位，理由见 WIDTH_BUCKETS 的注释
+        raw_width = max(len(encoding.ids) for encoding in encodings)
+        width = next((b for b in WIDTH_BUCKETS if b >= raw_width), MAX_LENGTH)
         input_ids = np.zeros((len(encodings), width), dtype=np.int64)
         attention_mask = np.zeros((len(encodings), width), dtype=np.int64)
         for row, encoding in enumerate(encodings):

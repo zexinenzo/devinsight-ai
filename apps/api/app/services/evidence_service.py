@@ -377,47 +377,58 @@ async def collect_evidence(
     local_limit: int = 8,
     web_limit: int = 8,
     include_web: bool = True,
+    # Agent 的 search_web 工具只要实时这一段。不关掉本地检索的话，每调一次
+    # 实时搜索就会白跑一次向量检索（几十毫秒 + 一次 embedder 调用），
+    # 而结果会被调用方全部丢掉。
+    include_local: bool = True,
     search_mode: str = "hybrid",
+    # 透传给精排：只排多少条候选。Agent 只要 6 条结果，排 40 条纯属浪费 CPU。
+    rerank_candidates: int | None = None,
 ) -> EvidenceBundle:
     """取一个问题的完整证据集：本地检索 + 实时搜索，各自标注可信度。"""
 
     now = datetime.now(UTC)
 
-    page = await document_service.list_documents(
-        session,
-        q=query,
-        limit=local_limit,
-        search_mode=search_mode if search_mode in ("vector", "hybrid") else "keyword",
-    )
-
     local: list[Evidence] = []
-    for document, source in page.items:
-        match = page.matches.get(document.id)
-        age = _age_days(document.published_at, now)
-        local.append(
-            Evidence(
-                channel="local",
-                title=document.title,
-                url=document.canonical_url,
-                snippet=document.summary,
-                published_at=document.published_at,
-                source_name=source.name,
-                # 本地来源的分级来自 sources 表的 credibility_tier，取值 A/B/C：
-                # A 一手（openai_news_en、ruanyifeng_zh、GitHub Release）、
-                # B 专业媒体（36kr_zh、infoq_zh、arxiv）、C 聚合与 UGC（hackernews_en）。
-                # web 侧用的是同一套语义，所以两边的 tier 可以直接比较——
-                # 这件事一开始写错过，注释里说「C 是 web 独有档」，查了 sources 表
-                # 才发现 HN 本来就是 C。
-                source_tier=source.credibility_tier,
-                score=match.similarity if match else None,
-                date_verified=document.published_at is not None,
-                in_local=True,
-                age_days=age,
-                freshness=freshness_band(age),
-                document_id=document.id,
-                char_start=match.char_start if match else None,
-            )
+    local_reranked = False
+
+    if include_local:
+        page = await document_service.list_documents(
+            session,
+            q=query,
+            limit=local_limit,
+            search_mode=search_mode if search_mode in ("vector", "hybrid") else "keyword",
+            rerank_candidates=rerank_candidates,
         )
+        local_reranked = page.reranked
+
+        for document, source in page.items:
+            match = page.matches.get(document.id)
+            age = _age_days(document.published_at, now)
+            local.append(
+                Evidence(
+                    channel="local",
+                    title=document.title,
+                    url=document.canonical_url,
+                    snippet=document.summary,
+                    published_at=document.published_at,
+                    source_name=source.name,
+                    # 本地来源的分级来自 sources 表的 credibility_tier，取值 A/B/C：
+                    # A 一手（openai_news_en、ruanyifeng_zh、GitHub Release）、
+                    # B 专业媒体（36kr_zh、infoq_zh、arxiv）、C 聚合与 UGC（hackernews_en）。
+                    # web 侧用的是同一套语义，所以两边的 tier 可以直接比较——
+                    # 这件事一开始写错过，注释里说「C 是 web 独有档」，查了 sources 表
+                    # 才发现 HN 本来就是 C。
+                    source_tier=source.credibility_tier,
+                    score=match.similarity if match else None,
+                    date_verified=document.published_at is not None,
+                    in_local=True,
+                    age_days=age,
+                    freshness=freshness_band(age),
+                    document_id=document.id,
+                    char_start=match.char_start if match else None,
+                )
+            )
 
     web: list[Evidence] = []
     verification = VerificationSummary()
@@ -465,7 +476,7 @@ async def collect_evidence(
         web=web,
         verification=verification,
         local_mode=search_mode,
-        local_reranked=page.reranked,
+        local_reranked=local_reranked,
         web_status=web_status,
         web_provider=provider.name if provider else None,
         web_topic=resolved_topic() if include_web else None,
