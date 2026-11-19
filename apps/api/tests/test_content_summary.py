@@ -154,6 +154,19 @@ def test_clip_summary_keeps_short_text_intact() -> None:
     assert _clip_summary("  一句话摘要。  ") == "一句话摘要。"
 
 
+def test_clip_summary_never_exceeds_limit() -> None:
+    """省略号也占一个字符。
+
+    这条如果不守，返回值会比上限多 1 字，而调用方判「超长」用的是 `> 上限`：
+    同一段文本每一轮都被判超长、再截一次，日志里会永久挂着「修复 14 条」，
+    看起来像有坏数据修不好——实测撞过一次。
+    """
+
+    clipped = _clip_summary("没有句号的长文本" * 80)
+    assert len(clipped) <= SUMMARY_MAX_CHARS
+    assert clipped.endswith("…")
+
+
 def test_apply_result_still_overwrites_fake_content_copy() -> None:
     """摘要补上之后，伪造正文的识别不能被带偏。"""
 

@@ -43,6 +43,22 @@ celery_app.conf.update(
         "dispatch-due-sources": {
             "task": "app.worker.tasks.dispatch_due_sources",
             "schedule": 300.0,
-        }
+        },
+        # 采集只拿元数据，正文要单独补。放进 beat 之后「新故事进库 → 半小时内
+        # 有摘要」成为默认行为，而不是等人想起来敲 make enrich
+        "enrich-hot-batch": {
+            "task": "app.worker.tasks.enrich_hot_batch",
+            "schedule": 1800.0,
+        },
+        # 热度决定抓谁。HN 的 score 在入库那一刻恒为 1，不回访就没有排序依据
+        "refresh-hot-scores": {
+            "task": "app.worker.tasks.refresh_hot_scores",
+            "schedule": 21600.0,
+        },
+        # 判重的输入是正文指纹，跟着 enrich 一起刷新，否则新条目永远游离在簇外
+        "dedup-recent": {
+            "task": "app.worker.tasks.dedup_recent",
+            "schedule": 3600.0,
+        },
     },
 )

@@ -17,9 +17,20 @@ import sys
 import unicodedata
 from datetime import timezone
 
+from sqlalchemy import text
+
 from app.core.logging import configure_logging
 from app.db.session import dispose_engine, session_scope
-from app.services import content_service, dedup_service, document_service, ingestion_service, source_service
+from app.services import (
+    content_service,
+    dedup_service,
+    document_service,
+    embedding_service,
+    ingestion_service,
+    source_service,
+    vector_index_service,
+)
+from app.services.embedding_service import EmbeddingUnavailable
 
 
 def _display_width(text: str) -> int:
@@ -130,11 +141,20 @@ async def _enrich(limit: int, per_source: int, concurrency: int) -> int:
             session, limit=limit, per_source=per_source, concurrency=concurrency
         )
     print(
-        f"正文补全：候选={summary['selected']} 成功={summary['fetched']} "
+        f"正文补全：候选={summary['selected']} 其中重试={summary['retried']} 成功={summary['fetched']} "
         f"无正文={summary['empty']} 失败={summary['failed']} "
         f"新得摘要={summary['summary_gained']} 存量修复={summary['summary_repaired']} "
         f"自帖归位={summary['self_posts_marked']} 耗时={summary['duration_ms']}ms"
     )
+    # 索引计数单独一行：它和抓取成功数不是一回事（正文太短、模型没装都会让索引为 0），
+    # 混在同一行里会让人以为「抓到了就等于索引了」
+    if summary.get("index_error"):
+        print(f"向量索引：跳过（{summary['index_error']}）")
+    elif summary["indexed_documents"]:
+        print(
+            f"向量索引：文档={summary['indexed_documents']} 块={summary['indexed_chunks']}"
+            "  ← 正文此刻还在内存里，这是它唯一能被索引的时机"
+        )
     if summary["selected"]:
         print("下一步：make dedup  ← 有了指纹才能判转载与聚类")
     return 0
@@ -174,6 +194,113 @@ async def _dedup(days: int, threshold: int, event_threshold: float) -> int:
         )
     print(f"去重完成：标记转载={result['reposts']} 聚簇改动={result['clustered']}")
     return 0
+
+
+async def _embed(limit: int, reindex: bool) -> int:
+    """用已入库正文补向量索引，并报告覆盖情况。"""
+
+    stale: dict[str, int] = {}
+    model_name = ""
+    try:
+        async with session_scope() as session:
+            model_name = embedding_service.get_embedder().name
+            if reindex:
+                # 重建前先清掉别的模型留下的块。`replace` 只删当前模型名下的旧块，
+                # 换过模型的那部分旧向量不会被任何写入路径碰到，会一直留在表里。
+                stale = await vector_index_service.purge_stale_models(
+                    session, keep_model=model_name
+                )
+            stats = await vector_index_service.index_from_stored_content(
+                session, limit=limit, only_missing=not reindex
+            )
+            coverage = await _embedding_coverage(session)
+    except EmbeddingUnavailable as error:
+        # 不吞掉原因：这条命令失败时，用户最需要知道的是「模型没下载」还是「库连不上」
+        print(f"向量化不可用：{error}")
+        return 1
+
+    if stale:
+        detail = "、".join(f"{name}={count} 块" for name, count in stale.items())
+        print(f"清理旧向量：{detail}（不属于当前模型 {model_name}，向量空间不同不能混用）")
+    print(
+        f"向量索引：文档={stats['documents']} 块={stats['chunks']} "
+        f"太短跳过={stats['skipped_short']}"
+    )
+    print(
+        f"覆盖情况：可索引文档={coverage['eligible']} 已建索引={coverage['indexed']} "
+        f"（{coverage['ratio']:.1%}）其中仅片段={coverage['excerpt_only']}，库里块数={coverage['chunks']}"
+    )
+    if coverage["eligible"] > coverage["indexed"]:
+        print("提示：还有文档没索引，跑 python -m app.cli embed --limit 500 继续")
+    if coverage["excerpt_only"]:
+        print(
+            "提示：有 "
+            f"{coverage['excerpt_only']} 篇只索引到了 600 字片段（授权级别所限，原文已丢弃）。"
+            "要覆盖全文只能重新抓取——索引会随 enrich 自动补上"
+        )
+    return 0
+
+
+async def _embedding_coverage(session) -> dict:
+    """索引覆盖率。
+
+    分子分母都只算「正文长到值得索引」的文档，短讯进分母会让覆盖率永远上不去，
+    看着像索引坏了，其实那批本来就只需要关键词检索。
+
+    `excerpt_only` 单独统计：这些文档的正文在库里只有 600 字（授权级别所限），
+    索引到的是片段而不是全文。把它和全文索引混在一个数字里，
+    会让人误以为「覆盖率 100% 就等于全文都能搜」。
+
+    所有 `EXISTS` 都带 `c.model = :model`。不带的话，换模型时旧模型的块会让覆盖率
+    显示成 100%，而检索实际上一条都命中不了——统计口径和检索口径必须一致。
+    """
+
+    model_name = embedding_service.get_embedder().name
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    count(*) FILTER (WHERE length(d.content_text) > :min_chars) AS eligible,
+                    count(*) FILTER (
+                        WHERE length(d.content_text) > :min_chars
+                          AND EXISTS (
+                              SELECT 1 FROM document_chunks c
+                               WHERE c.document_id = d.id AND c.model = :model
+                          )
+                    ) AS indexed,
+                    count(*) FILTER (
+                        WHERE length(d.content_text) > :min_chars
+                          AND length(d.content_text) <= :excerpt_chars
+                          AND EXISTS (
+                              SELECT 1 FROM document_chunks c
+                               WHERE c.document_id = d.id AND c.model = :model
+                          )
+                    ) AS excerpt_only
+                  FROM documents d
+                """
+            ),
+            {
+                "min_chars": embedding_service.CHUNK_CHARS,
+                "excerpt_chars": content_service.EXCERPT_CHARS,
+                "model": model_name,
+            },
+        )
+    ).one()
+    chunks = (
+        await session.execute(
+            text("SELECT count(*) FROM document_chunks WHERE model = :model"),
+            {"model": model_name},
+        )
+    ).scalar_one()
+    eligible, indexed, excerpt_only = int(row[0]), int(row[1]), int(row[2])
+    return {
+        "eligible": eligible,
+        "indexed": indexed,
+        "excerpt_only": excerpt_only,
+        "ratio": (indexed / eligible) if eligible else 0.0,
+        "chunks": int(chunks),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -228,6 +355,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="覆盖 API 源（HN / GitHub / arXiv），会消耗真实 API 额度",
     )
+
+    embed_parser = sub.add_parser(
+        "embed",
+        help="用已入库正文建向量索引（只对存了全文的源有效）",
+    )
+    embed_parser.add_argument("--limit", type=int, default=500, help="本次最多索引多少篇")
+    embed_parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="连已有索引的文档一起重算（换模型后必须跑）",
+    )
     return parser
 
 
@@ -253,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
                 return await _dedup(args.days, args.threshold, args.event_threshold)
             if args.command == "refingerprint":
                 return await _refingerprint(args.all_sources)
+            if args.command == "embed":
+                return await _embed(args.limit, args.reindex)
             return 2
         finally:
             await dispose_engine()

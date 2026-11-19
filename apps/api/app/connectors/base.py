@@ -18,7 +18,12 @@ from typing import Any
 # bot 管理、一律 403）。它们的条目一律不进网页抓取队列——进了也是每轮白跑、
 # 每轮失败，还会把「抓取失败率」长期钉在高位，掩盖真正需要关注的失败。
 # 放在 base 里是因为 Connector 与采集层都要用它判断正文来源。
-NO_FETCH_SOURCES = ("36kr_zh", "infoq_en", "openai_news_en")
+#
+# infoq_zh / sspai_zh 加进来是另一类原因：不是抓不到，是不该抓。
+# 这两家只授权了 RSS 摘要（feed 里也没给正文），没有页面抓取的许可。
+# 把它们留在候选里，enrich 每轮都会去请求文章页——技术上是爬虫行为，
+# 法律上没有依据，收益又只是把 150 字的摘要换成 600 字。
+NO_FETCH_SOURCES = ("36kr_zh", "infoq_en", "openai_news_en", "infoq_zh", "sspai_zh")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +61,9 @@ class SourceSpec:
             access_method=source.access_method,
             region=source.region,
             language=source.language,
+            # 之前这一行漏了，导致 sources.rights_mode 永远读不到，
+            # 所有源都在用 dataclass 的默认值 metadata_excerpt。
+            rights_mode=getattr(source, "rights_mode", "metadata_excerpt") or "metadata_excerpt",
             request_timeout_seconds=source.request_timeout_seconds,
             max_items=max_items,
             parser_version=source.parser_version,

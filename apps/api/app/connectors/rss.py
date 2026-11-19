@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from datetime import datetime, timezone
 
@@ -32,14 +33,72 @@ logger = get_logger(__name__)
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
 
+# 摘要短于这个长度就当没给。10 字是校准出来的：真实的快讯摘要最短能到
+# 「苹果发布新款 MacBook Pro」这种量级（14 字），而导航残渣
+# 「点击查看原文>」只有 7 字。10 这条线两边都留了余量，主要靠下面的
+# 正则做精确判断，长度只是兜底。
+MIN_SUMMARY_CHARS = 10
+
+# 媒体 feed 常把摘要做成一个导流链接：InfoQ 中文的 <description> 清洗后
+# 就是「点击查看原文>」7 个字；少数派则是在真摘要后面缀一句「查看全文」。
+_NAV_ONLY = re.compile(r"^[（(【\[]?(点击|查看|阅读|前往|跳转).{0,14}(原文|全文|详情|更多)[>》）)】\]]?$")
+_TRAILING_MORE = re.compile(r"\s*[（(【\[]?(点击)?(查看|阅读)(全文|原文|详情|更多)[）)】\]]?\s*[>》]?\s*$")
+
+# 语言标签归一：feed 里 zh-CN / zh-Hans / zh-TW / en-US 混着来（少数派给 zh-CN，
+# OpenAI News 给 en-US），检索分组只认主语言，细分标签留着会让「中文语料多少条」
+# 这类统计失真。
+#
+# 上一版是一张 zh-* 的穷举别名表，结果 OpenAI News 的 200 条全是 en-US：
+# 前端按 language=en 筛选时整批消失，统计里也平白多出一种「语言」。
+# 穷举别名注定漏——改成「取 BCP-47 主标签」，地区细分一律丢掉。
+_PRIMARY_LANGUAGE_BASES = ("zh", "en", "ja", "ko", "fr", "de", "es", "pt", "ru")
+
+
+def _normalize_language(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = value.strip().lower().replace("_", "-")
+    primary = cleaned.split("-")[0]
+    # 只对已知主语言做收敛：未知标签原样保留，免得把 it-IT 之类误认成 it 之前先猜错。
+    return primary if primary in _PRIMARY_LANGUAGE_BASES else cleaned
+
+
+def _usable_summary(text_value: str) -> str | None:
+    """把 feed 文本变成能当摘要用的字符串，取不到就返回 None。
+
+    三件事都是真实数据逼出来的：
+
+    1. 切掉站点加的「查看全文」尾巴——少数派每条都带，检索时会污染匹配；
+    2. 丢掉纯导航文字——InfoQ 中文的 description 就是「点击查看原文>」，
+       存进库会让 20 条记录共用同一句「摘要」；
+    3. 统一截到 summary_max_chars，防止个别源把整篇塞进 summary 字段。
+
+    返回 None 而不是空串：上游据此打 `missing_summary` 标记，前端才能
+    区分「这个源本来就没给摘要」和「我们解析时弄丢了」。
+    """
+
+    cleaned = (text_value or "").strip()
+    if not cleaned:
+        return None
+    cleaned = _TRAILING_MORE.sub("", cleaned).strip()
+    if len(cleaned) < MIN_SUMMARY_CHARS or _NAV_ONLY.match(cleaned):
+        return None
+    return truncate(cleaned, settings.summary_max_chars)
+
 # feed 自带文本超过这个长度，就认为它给的是整篇正文而不是摘要。
-# 实测分布：36氪 3414~14173 字，InfoQ 425~581，OpenAI 155~165。1200 这条线
-# 两边都有余量，不会把摘要型 feed 误判成全文型。
+# 实测分布（2026-11 抽样）：美团 8214 字、阮一峰 2527、36氪 215（中位）~9283、
+# InfoQ 177、掘金 95。注意 36氪 的分布极不均匀——头条深度稿给全文，
+# 日更快讯只有 200 字左右，用中位数看它其实是「摘要型」feed。
 FEED_FULLTEXT_MIN_CHARS = 1200
 
 # 与 content_service.FULL_TEXT_RIGHTS 同一口径。这里重复一份，是为了让
 # Connector 不反向依赖 service 层——Connector 应当能脱离数据库单独测试。
-FULL_TEXT_RIGHTS = ("full_text", "public_domain")
+FULL_TEXT_RIGHTS = ("full_text", "public_domain", "cc_by_nc_nd")
+
+# 与 content_service.FULL_TEXT_MAX_CHARS 保持一致。
+# 这里曾经硬编码 4000，把阮一峰 5000~5500 字的周刊截掉了四分之一，
+# 而且截得毫无道理——权利人已经用 CC 协议放开全文，我们没有理由再削。
+FULL_TEXT_MAX_CHARS = 20000
 
 
 class RetryableUpstreamStatus(Exception):
@@ -118,7 +177,7 @@ class RSSConnector(BaseConnector):
             except (IndexError, AttributeError, TypeError):
                 pass
 
-        summary = truncate(feed_text, settings.summary_max_chars) if feed_text else None
+        summary = _usable_summary(feed_text)
 
         # feed 自带长文本时：只留指纹，不留正文。
         # rights_note 写的是「全文不入库」，但没禁止用它做判断——64 位哈希不是
@@ -130,7 +189,7 @@ class RSSConnector(BaseConnector):
             fingerprint = simhash(feed_text)
             content_status = "from_feed"
         if feed_text and self.spec.rights_mode in FULL_TEXT_RIGHTS:
-            content_text = truncate(feed_text, 4000)
+            content_text = truncate(feed_text, FULL_TEXT_MAX_CHARS)
 
         published_at = (
             parse_struct_time(entry.get("published_parsed"))
@@ -147,7 +206,7 @@ class RSSConnector(BaseConnector):
         if not summary:
             quality_flags.append("missing_summary")
 
-        language = (entry.get("language") or feed_language or self.spec.language or None)
+        language = _normalize_language(entry.get("language") or feed_language or self.spec.language)
         external_id = str(entry.get("id") or entry.get("guid") or canonical_url)
 
         return CanonicalDocument(

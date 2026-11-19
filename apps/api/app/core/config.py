@@ -47,12 +47,23 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://devinsight:change_me_dev@localhost:5432/devinsight"
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- 模型与搜索（后续阶段使用，此处先留占位）---
+    # --- 模型与搜索 ---
     llm_provider: str = "openai"
     llm_api_key: str = ""
     llm_model: str = ""
-    embedding_model: str = ""
-    embedding_dimensions: int = 1536
+    # 向量化只走本地模型：把全文发给第三方 API 做嵌入，法律性质会从「我们自己存储」
+    # 变成「向第三方提供作品」，等于绕过了 rights_mode 那道闸门。
+    #
+    # onnx = 本地 ONNX 推理；hashing = 字符哈希假向量（只用于测试/离线演示）；
+    # disabled = 彻底关掉，检索退回关键词。
+    embedding_backend: str = "onnx"
+    # 必须能覆盖中英混排：语料是 981 英 / 450 中，纯中文模型嵌英文会失真
+    embedding_model: str = "intfloat/multilingual-e5-small"
+    # 这个数字必须和模型输出维度一致，建表时写进了 vector(N)，改模型要重跑迁移。
+    # 曾经这里是 1536（OpenAI 的量纲），和本地模型对不上，必须先改掉再建表。
+    embedding_dimensions: int = 384
+    # 留空则用 ~/.cache/devinsight/models/<模型名>，模型文件不进仓库
+    embedding_model_dir: str = ""
     web_search_provider: str = ""
     web_search_api_key: str = ""
     github_token: str = ""

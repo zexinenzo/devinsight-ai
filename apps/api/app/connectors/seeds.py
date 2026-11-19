@@ -31,6 +31,10 @@ class SourceSeed:
     robots_url: str | None = None
     terms_url: str | None = None
     rights_note: str | None = None
+    # 落库长度的判据。默认 metadata_excerpt：只存 600 字片段。
+    # 只有拿到明确开放授权（CC / 公有领域 / 站点明示）的源才能改成全文级，
+    # 因为这一列直接决定 content_service._store_text 截多少字。
+    rights_mode: str = "metadata_excerpt"
 
 
 SOURCE_SEEDS: tuple[SourceSeed, ...] = (
@@ -49,6 +53,64 @@ SOURCE_SEEDS: tuple[SourceSeed, ...] = (
         poll_interval_minutes=30,
         robots_url="https://36kr.com/robots.txt",
         rights_note="科技商业媒体。仅保存标题、摘要与原文链接，全文不入库；转载与全文授权需另行核实。",
+    ),
+    SourceSeed(
+        source_key="ruanyifeng_zh",
+        name="阮一峰的网络日志",
+        canonical_domain="ruanyifeng.com",
+        source_type="blog",
+        access_method="rss",
+        base_url="https://www.ruanyifeng.com/blog/atom.xml",
+        region="cn",
+        language="zh",
+        # 一手作者署名、可追溯到具体某个人，比聚合媒体的可信度高一档
+        credibility_tier="A",
+        enabled=True,
+        priority=1,
+        # 周刊固定每周一期，2 小时轮询纯属浪费带宽
+        poll_interval_minutes=720,
+        robots_url="https://www.ruanyifeng.com/robots.txt",
+        terms_url="http://creativecommons.org/licenses/by-nc-nd/3.0/deed.zh",
+        # 全文可入库的依据是权利人自己放开的协议，不是我们的判断
+        rights_mode="cc_by_nc_nd",
+        rights_note=(
+            "个人技术博客。页面明示授权「自由转载-非商用-非衍生-保持署名」，"
+            "即 CC BY-NC-ND 3.0（creativecommons.org/licenses/by-nc-nd/3.0/deed.zh）。"
+            "故全文可入库，但 ND 禁止演绎：摘要必须原样摘取，不能改写或机器润色；"
+            "亦不可用于商业用途。"
+        ),
+    ),
+    SourceSeed(
+        source_key="infoq_zh",
+        name="InfoQ 中文",
+        canonical_domain="infoq.cn",
+        source_type="media",
+        access_method="rss",
+        base_url="https://www.infoq.cn/feed",
+        region="cn",
+        language="zh",
+        credibility_tier="B",
+        enabled=True,
+        priority=2,
+        poll_interval_minutes=120,
+        robots_url="https://www.infoq.cn/robots.txt",
+        rights_note="技术媒体。未检索到开放授权声明，按默认版权处理：仅存摘要与原文链接，全文不入库。",
+    ),
+    SourceSeed(
+        source_key="sspai_zh",
+        name="少数派",
+        canonical_domain="sspai.com",
+        source_type="media",
+        access_method="rss",
+        base_url="https://sspai.com/feed",
+        region="cn",
+        language="zh",
+        credibility_tier="B",
+        enabled=True,
+        priority=3,
+        poll_interval_minutes=180,
+        robots_url="https://sspai.com/robots.txt",
+        rights_note="效率与消费科技媒体。未检索到开放授权声明，仅存摘要与原文链接，全文不入库。",
     ),
     SourceSeed(
         source_key="infoq_en",

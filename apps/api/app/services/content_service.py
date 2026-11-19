@@ -25,10 +25,14 @@ HN 的分数最多几千，全局混排会让 GitHub 永远排第一，RSS 和 a
 是两种结论。前者重试一百次也没用；后者按原因存在 `content_error` 里，例如
 `HTTP 403`、`ProxyError: 502`。
 
-**失败的条目不会被自动重试**，这一点是刻意的：实测下来失败原因绝大多数是
-`HTTP 403/405`（站点的反爬策略），重试只会把同一个请求再打一遍，既浪费时间，
-也可能让对方把 IP 拉黑。真需要重抓时，用 SQL 把 `content_status` 改回 `pending` 即可。
-用「无条件重试三次」换来的那点成功率，不值得把每一批的耗时翻三倍。
+**失败分两种，只有一种会重试。** 实测失败原因一半是 `HTTP 403/405`（反爬）
+和付费墙——重试只会把同一个请求再打一遍，既浪费时间，也可能让对方把 IP 拉黑；
+另一半是本机代理 502、连接超时，这类是瞬时的，代理规则一改或网络恢复就能通。
+
+所以 `failed` 不是终态，但也**不是无脑重试**：每次失败记一次
+`content_attempts`，按 6h → 24h → 72h 退避后重新进入候选，三次用完为止。
+确定性失败（4xx / 非 HTML）在写库时就把次数记满，等价于「永不重试」——
+筛选时只比数字，不必在 SQL 里再做一遍字符串匹配。
 
 **并发与写库分开。** 下载是 I/O，适合并发；ORM 对象不并发安全，多个协程同时改同一个
 session 里的对象会串。所以流程是「并发下载 → 汇总 → 串行写库」，网络阶段不碰 session。
@@ -45,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import func, literal_column, select
+from sqlalchemy import and_, case, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -53,6 +57,8 @@ from app.connectors.base import NO_FETCH_SOURCES
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.models import Document, Source
+from app.services import embedding_service, vector_index_service
+from app.services.embedding_service import EmbeddingUnavailable
 from app.utils.engagement import normalize_engagement
 from app.utils.simhash import simhash
 from app.utils.webpage import extract_main_text, extract_meta_description
@@ -60,7 +66,11 @@ from app.utils.webpage import extract_main_text, extract_meta_description
 logger = get_logger(__name__)
 
 # 落库策略：不在这个白名单里的源一律只存摘要片段
-FULL_TEXT_RIGHTS = ("full_text", "public_domain")
+#
+# cc_by_nc_nd 是「页面写明 CC 署名-非商用-非衍生」的源（目前只有阮一峰博客）。
+# 它能进这个白名单，是因为权利人自己用协议放开了复制与转载，不涉及我们的合规判断；
+# 但 ND（禁止演绎）这一条必须由调用方守住——只能原样展示，不能改写摘要。
+FULL_TEXT_RIGHTS = ("full_text", "public_domain", "cc_by_nc_nd")
 # 摘要片段长度。够回答「这条讲什么」，不足以替代原文阅读
 EXCERPT_CHARS = 600
 # 派生摘要的长度上限。列表只显示两行，300 字已经溢出可视区域；
@@ -73,6 +83,14 @@ FULL_TEXT_MAX_CHARS = 20000
 FETCH_TIMEOUT_SECONDS = 15
 # 连接类错误重试次数（不含 4xx——那是确定性失败，重试无意义）
 MAX_ATTEMPTS = 2
+# 跨轮次的重试预算：一条条目最多被抓几次。一次抓取本身已经内含 MAX_ATTEMPTS 次
+# 传输层重试，所以这里说的「3 次」是三个独立的调度轮次，中间隔着退避间隔
+MAX_FETCH_ATTEMPTS = 3
+# 第 N 次失败之后要等多久才重新进入候选。间隔递增的理由很实际：
+# 瞬时故障（网络抖动、代理临时 502）通常几分钟就恢复，等 6 小时已经足够保守；
+# 等了 24 小时还失败，说明大概率不是抖动，再等 72 小时是给「域名级封锁临时解除」
+# 留的最后一次机会
+RETRY_BACKOFF_HOURS = (6, 24, 72)
 
 # HN 的 source_key；回访热度只对它有意义（详情接口能单独取单个 item）
 HACKERNEWS_KEY = "hackernews_en"
@@ -93,6 +111,49 @@ class PageResult:
     # 页面自带的描述（og:description / meta description）。它是编辑写的导语，
     # 比「正文前 300 字」更适合当摘要，所以正文和它都要，不能二选一。
     summary_hint: str | None = None
+
+
+def _is_retryable_error(error: str) -> bool:
+    """判断一次失败值不值得下一轮再试。
+
+    分界线是「对方的回答是确定性的，还是环境性的」：
+
+    - `HTTP 403/404/405`、付费墙、非 HTML 内容——站点已经明确表态，再敲一次门
+      得到的还是同一句话，重试只是替对方刷日志；
+    - `HTTP 5xx`、`HTTP 429`、`ProxyError` / `ConnectError` / `ReadTimeout`——
+      失败发生在网络层或对方临时过载，换个时间大概率能通。
+
+    这个判断放在写库时做一次，而不是留在 SQL 里靠 `LIKE 'HTTP 4%'` 之类匹配：
+    错误串的格式会随 `_download` 的实现变化，而写库点是唯一知道「这次到底为什么
+    失败」的地方。
+    """
+
+    if not error:
+        return False
+    if error.startswith("非 HTML"):
+        return False
+
+    matched = re.match(r"HTTP\s+(\d{3})", error)
+    if matched:
+        code = int(matched.group(1))
+        # 4xx 是对方拒绝，429 除外——限流的正确反应是等，不是放弃
+        return code == 429 or code >= 500
+    return True
+
+
+def _retry_backoff_expression():
+    """把「第几次失败等多久」翻译成 SQL 的 interval 表达式。
+
+    放在 SQL 里而不是 Python 里，是因为退避判断必须和候选筛选在同一次查询中完成：
+    先取出所有 failed 再在内存里过滤，会把整张失败表拉进内存，而这个表只会越来越大。
+    """
+
+    first, second, last = RETRY_BACKOFF_HOURS
+    return case(
+        (Document.content_attempts <= 1, literal_column(f"interval '{int(first)} hours'")),
+        (Document.content_attempts == 2, literal_column(f"interval '{int(second)} hours'")),
+        else_=literal_column(f"interval '{int(last)} hours'"),
+    )
 
 
 async def select_candidates(
@@ -117,10 +178,22 @@ async def select_candidates(
     )
     window = literal_column(f"interval '{int(within_days)} days'")
 
+    # 失败条目重新入队的条件：还有预算、且退避时间已过。
+    # content_fetched_at 为空说明它失败在加入这一列之前，没有时间参照，直接放行——
+    # 这类记录最多只有一批，宁可多抓一次也不能让它永久卡住。
+    retryable_failure = and_(
+        Document.content_status == "failed",
+        Document.content_attempts < MAX_FETCH_ATTEMPTS,
+        or_(
+            Document.content_fetched_at.is_(None),
+            Document.content_fetched_at < func.now() - _retry_backoff_expression(),
+        ),
+    )
+
     ranked = (
         select(Document.id.label("doc_id"), row_number.label("rn"))
         .where(
-            Document.content_status == "pending",
+            or_(Document.content_status == "pending", retryable_failure),
             Document.fetched_at >= func.now() - window,
             Document.source_id.not_in(select(Source.id).where(Source.source_key.in_(NO_FETCH_SOURCES))),
         )
@@ -346,7 +419,10 @@ def _clip_summary(text_value: str) -> str:
         position = head.rfind(punct)
         if position >= SUMMARY_MAX_CHARS // 2:
             return head[: position + len(punct)].strip()
-    return head.rstrip() + "…"
+    # 省略号本身占一个字符，必须从窗口里让出来。否则返回值是 301 字，
+    # 而调用方判「超长」用的是 > 300——同一段文本每一轮都被判超长、再截一次，
+    # 「修复 14 条」会永远挂在日志里，看起来像有 14 条坏数据修不好。
+    return head[: SUMMARY_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _looks_like_title(text_value: str, title: str) -> bool:
@@ -429,6 +505,19 @@ def _derive_summary(text_value: str, title: str = "") -> str | None:
     return None
 
 
+def _next_attempts(document: Document, error: str) -> int:
+    """算这次失败之后 `content_attempts` 该记几。
+
+    可重试的错误累加真实的失败次数；确定性错误直接把预算记满——这样
+    `select_candidates` 只要看到「次数到顶」就知道不必再考虑它，不需要理解
+    错误串的含义。把判断结果**落到数据上**，而不是每次筛选重算，是这里的关键。
+    """
+
+    if not _is_retryable_error(error):
+        return MAX_FETCH_ATTEMPTS
+    return min((document.content_attempts or 0) + 1, MAX_FETCH_ATTEMPTS)
+
+
 def apply_result(document: Document, result: PageResult) -> str:
     """把取页结果写到 ORM 对象上。只在主协程里调用。"""
 
@@ -436,6 +525,8 @@ def apply_result(document: Document, result: PageResult) -> str:
     document.content_fetched_at = datetime.now(timezone.utc)
     # 成功时清空原因：否则上一轮的 403 会一直挂在这条记录上，看起来像这次也失败了
     document.content_error = result.error or None
+    if result.status == "failed":
+        document.content_attempts = _next_attempts(document, result.error)
 
     if result.engagement:
         _merge_engagement(document, result.engagement)
@@ -550,12 +641,11 @@ async def backfill_summaries_from_content(session: AsyncSession, *, limit: int =
     repaired = 0
     for document in documents:
         current = (document.summary or "").strip()
-        # 超长的摘要来自「早期版本直接落库 og:description、没有截断」的遗留数据。
-        # 列表里塞 677 字会把整页撑开，先截到统一长度。
-        if len(current) > SUMMARY_MAX_CHARS:
-            document.summary = _clip_summary(current)
-            repaired += 1
-            continue
+        # 这里刻意不按长度截断。两个理由：
+        # 一是展示层已经用 line-clamp 收口，库里长一点不会把页面撑坏；
+        # 二是 arXiv 的摘要有 1400~1900 字，削到 300 会把结论部分丢掉——而那正是
+        # 这条记录最有价值的信息。截断只应该发生在「机器从正文里切一段」的时候，
+        # 不该发生在「上游给了完整摘要」的时候。
         # 只处理三种坏摘要：空的、只是标题的、界面残渣的。
         # 正常摘要（来自 feed 的编辑导语）一律不动——那比机器截的句子质量高。
         if current and not _looks_like_title(current, document.title) and not _is_noise_summary(current):
@@ -606,6 +696,30 @@ async def mark_self_posts_as_from_feed(session: AsyncSession) -> int:
     return len(documents)
 
 
+def _enrich_summary() -> dict[str, Any]:
+    """enrich 返回值的模板。
+
+    「有候选」和「没候选」两条路径共用它，键集合因此不会漂移。调用方是按直接下标
+    取值的（`summary["indexed_documents"]`），少一个键就会在「恰好没有候选」这个
+    最不该出问题的分支上抛 KeyError——这不是假设，是实测撞出来的。
+    """
+
+    return {
+        "selected": 0,
+        "retried": 0,
+        "fetched": 0,
+        "empty": 0,
+        "failed": 0,
+        "summary_gained": 0,
+        "summary_repaired": 0,
+        "self_posts_marked": 0,
+        "indexed_documents": 0,
+        "indexed_chunks": 0,
+        "index_error": None,
+        "duration_ms": 0,
+    }
+
+
 async def run_enrich(
     session: AsyncSession,
     *,
@@ -625,18 +739,18 @@ async def run_enrich(
     marked = await mark_self_posts_as_from_feed(session)
 
     candidates = await select_candidates(session, limit=limit, per_source=per_source)
+    # 这一批里有多少是「上次失败、退避已过」的条目。运维上必须能区分
+    # 「在追新内容」和「在还旧账」：否则失败率长期降不下来时，看不出是重试在打转
+    retried = sum(1 for document in candidates if document.content_status == "failed")
     if not candidates:
         logger.info("enrich_no_candidate")
-        return {
-            "selected": 0,
-            "fetched": 0,
-            "empty": 0,
-            "failed": 0,
-            "summary_gained": 0,
-            "summary_repaired": repaired,
-            "self_posts_marked": marked,
-            "duration_ms": 0,
-        }
+        # 用同一个构造函数产出，而不是手写一份"零值字典"。手写副本迟早和正常路径
+        # 漂移——实测就是少了一个键，调用方按直接下标取值，在「恰好没有候选」
+        # 这种最不该崩的时刻抛了 KeyError。
+        summary = _enrich_summary()
+        summary["summary_repaired"] = repaired
+        summary["self_posts_marked"] = marked
+        return summary
 
     started = time.perf_counter()
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -656,17 +770,43 @@ async def run_enrich(
     after_with_summary = sum(1 for document in candidates if (document.summary or "").strip())
     await session.commit()
 
+    # 正文此刻还在内存里（`result.text`），**这是它唯一一次可用于向量化的时机**。
+    # `metadata_excerpt` 级别的源走完 `_store_text` 之后库里只剩 600 字，剩下几万字
+    # 随这个函数返回就被 GC 掉。所以索引必须在这里做，挪到事后的批处理任务就晚了——
+    # 那时能索引的只有已经入库的那点片段，等于把短摘要再向量化一遍，白忙。
+    index_stats: dict[str, int] = {"documents": 0, "chunks": 0}
+    index_error: str | None = None
+    long_texts = [
+        (document.id, result.text or "")
+        for document, result in zip(candidates, results)
+        if result.status == "fetched" and len(result.text or "") > embedding_service.CHUNK_CHARS
+    ]
+    if long_texts:
+        try:
+            index_stats = await vector_index_service.index_documents(session, long_texts)
+            await session.commit()
+        except EmbeddingUnavailable as error:
+            # 模型没装好不该连累抓取：正文已经落库，索引下一轮还能补。
+            # 但必须把原因带进返回值，让 CLI 打印出来——静默跳过会变成长期空洞。
+            index_error = str(error).splitlines()[0]
+            logger.warning("vector_index_unavailable", extra={"error": index_error})
+
     duration_ms = int((time.perf_counter() - started) * 1000)
-    summary = {
-        "selected": len(candidates),
-        "fetched": counters.get("fetched", 0),
-        "empty": counters.get("empty", 0),
-        "failed": counters.get("failed", 0),
-        "summary_gained": after_with_summary - before_with_summary,
-        "summary_repaired": repaired,
-        "self_posts_marked": marked,
-        "duration_ms": duration_ms,
-    }
+    summary = _enrich_summary()
+    summary.update(
+        selected=len(candidates),
+        retried=retried,
+        fetched=counters.get("fetched", 0),
+        empty=counters.get("empty", 0),
+        failed=counters.get("failed", 0),
+        summary_gained=after_with_summary - before_with_summary,
+        summary_repaired=repaired,
+        self_posts_marked=marked,
+        indexed_documents=index_stats.get("documents", 0),
+        indexed_chunks=index_stats.get("chunks", 0),
+        index_error=index_error,
+        duration_ms=duration_ms,
+    )
     logger.info("enrich_done", extra=summary)
     return summary
 

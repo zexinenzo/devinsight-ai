@@ -10,13 +10,23 @@ from fastapi import APIRouter, Query, Request
 from app.api.deps import SessionDep
 from app.db.models import Document, Source
 from app.schemas.common import envelope
-from app.schemas.document import DocumentDetail, DocumentListItem, DocumentSourceBrief
+from app.schemas.document import (
+    DocumentDetail,
+    DocumentListItem,
+    DocumentMatch,
+    DocumentSourceBrief,
+)
 from app.services import document_service
 
 router = APIRouter(tags=["documents"])
 
 
-def to_list_item(document: Document, source: Source, cluster_size: int = 1) -> DocumentListItem:
+def to_list_item(
+    document: Document,
+    source: Source,
+    cluster_size: int = 1,
+    match: DocumentMatch | None = None,
+) -> DocumentListItem:
     return DocumentListItem(
         id=document.id,
         title=document.title,
@@ -37,7 +47,9 @@ def to_list_item(document: Document, source: Source, cluster_size: int = 1) -> D
         content_error=document.content_error,
         dup_of=document.dup_of,
         cluster_id=document.cluster_id,
+        # 同一事件共有几家在报；1 表示只有这一条
         cluster_size=cluster_size,
+        match=match,
         source=DocumentSourceBrief(
             id=source.id,
             source_key=source.source_key,
@@ -65,6 +77,14 @@ async def list_documents(
     cursor: str | None = Query(None, description="上一页返回的 next_cursor"),
     sort: str = Query("time", pattern="^(time|engagement)$", description="time 按时间 / engagement 按热度"),
     include_reposts: bool = Query(False, description="是否显示转载副本（默认隐藏）"),
+    mode: str = Query(
+        "keyword",
+        pattern="^(keyword|vector|hybrid)$",
+        description=(
+            "检索方式。keyword 匹配标题与摘要；vector 用本地模型把问句编码后比正文块向量，"
+            "能命中摘要之外的内容，但只有第一页；hybrid 把两者按名次融合"
+        ),
+    ),
 ):
     page = await document_service.list_documents(
         session,
@@ -80,12 +100,30 @@ async def list_documents(
         cursor=cursor,
         sort=sort,
         include_reposts=include_reposts,
+        search_mode=mode,
     )
     items = [
-        to_list_item(document, src, page.cluster_sizes.get(document.cluster_id, 1)).model_dump(mode="json")
+        to_list_item(
+            document,
+            src,
+            page.cluster_sizes.get(document.cluster_id, 1),
+            _to_schema_match(page.matches.get(document.id)),
+        ).model_dump(mode="json")
         for document, src in page.items
     ]
     return envelope(request, items, total=page.total, next_cursor=page.next_cursor)
+
+
+def _to_schema_match(match: document_service.MatchInfo | None) -> DocumentMatch | None:
+    """服务层的 MatchInfo 转成响应模型。
+
+    两个 dataclass 字段几乎一样，但仍然分成两层：服务层不该依赖 HTTP 层的
+    Pydantic 模型，否则以后改响应字段会牵动检索逻辑。
+    """
+
+    if match is None:
+        return None
+    return DocumentMatch(mode=match.mode, similarity=match.similarity, char_start=match.char_start)
 
 
 @router.get("/documents/{document_id}", summary="文档详情")

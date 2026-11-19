@@ -178,12 +178,12 @@ async def sync_source(
     rows = _document_rows(source, outcome.documents)
     created = 0
     if rows:
-        statement = (
-            insert(Document)
-            .values(rows)
-            .on_conflict_do_nothing(index_elements=["source_id", "external_id"])
-            .returning(Document.id)
-        )
+        # 不带冲突目标：`(source_id, external_id)` 和
+        # `(source_id, canonical_url)` 任何一个被撞都跳过。
+        # 只写 external_id 会漏——同一篇文章经两条写入路径进来时
+        # （feed 给 Atom id、历史回填只给 URL），external_id 不同而
+        # canonical_url 相同，会各插一行。
+        statement = insert(Document).values(rows).on_conflict_do_nothing().returning(Document.id)
         result = await session.execute(statement)
         created = len(result.scalars().all())
 

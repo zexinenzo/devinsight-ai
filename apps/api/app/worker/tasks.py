@@ -77,3 +77,86 @@ def dispatch_due_sources() -> dict[str, Any]:
     for source_id in result["due"]:
         sync_source_task.delay(source_id, "schedule")
     return {"dispatched": len(result["due"])}
+
+
+# --- 阶段 3 的常驻环节 ---
+#
+# 这三件事都有 CLI 入口（make enrich / engagement / dedup），但只靠人手跑等于
+# 系统不会自转：采集每 5 分钟自动跑，补正文却要等人想起来。结果是列表里
+# 一堆 pending，而「按热度抓」这个设计承诺始终停留在命令行的使用说明书里。
+
+
+async def _run_enrich(limit: int, per_source: int, concurrency: int) -> dict[str, Any]:
+    from app.services import content_service
+
+    try:
+        async with session_scope() as session:
+            return await content_service.run_enrich(
+                session, limit=limit, per_source=per_source, concurrency=concurrency
+            )
+    finally:
+        await dispose_engine()
+
+
+@celery_app.task(name="app.worker.tasks.enrich_hot_batch")
+def enrich_hot_batch(limit: int = 20, per_source: int = 5, concurrency: int = 6) -> dict[str, Any]:
+    """每 30 分钟补一小批正文。
+
+    刻意跑小批量：一次抓 400 条要十几分钟，期间占满连接池并拖慢同步任务；
+    拆成 20 条一轮，新故事入库后半小时内就能拿到摘要，代价是失败条目要
+    多等几个轮次才轮到——而它们本来就有退避间隔。
+    """
+
+    result = asyncio.run(_run_enrich(limit, per_source, concurrency))
+    logger.info("task_enrich_hot_batch_done", extra=result)
+    return result
+
+
+async def _run_refresh_engagement(within_days: int, limit: int, concurrency: int) -> dict[str, int]:
+    from app.services import content_service
+
+    try:
+        async with session_scope() as session:
+            return await content_service.refresh_engagement(
+                session, within_days=within_days, limit=limit, concurrency=concurrency
+            )
+    finally:
+        await dispose_engine()
+
+
+@celery_app.task(name="app.worker.tasks.refresh_hot_scores")
+def refresh_hot_scores(within_days: int = 14, limit: int = 300, concurrency: int = 8) -> dict[str, int]:
+    """每 6 小时回访一次热度。
+
+    HN 的 `newstories` 只返回刚发布的故事，那一刻 `score` 恒为 1。不对已入库的
+    条目做回访，「按热度抓正文」就退化成「按发布顺序抓」——所有候选在排序时
+    热度都一样低。热度只增不减（`_merge_engagement` 取历史最大），所以回访
+    不会把曾经的热帖重新判成冷门。
+    """
+
+    result = asyncio.run(_run_refresh_engagement(within_days, limit, concurrency))
+    logger.info("task_refresh_hot_scores_done", extra=result)
+    return result
+
+
+async def _run_dedup(within_days: int) -> dict[str, int]:
+    from app.services import dedup_service
+
+    try:
+        async with session_scope() as session:
+            return await dedup_service.run_dedup(session, within_days=within_days)
+    finally:
+        await dispose_engine()
+
+
+@celery_app.task(name="app.worker.tasks.dedup_recent")
+def dedup_recent(within_days: int = 14) -> dict[str, int]:
+    """每小时重跑判重与聚类。
+
+    输入是正文指纹，而指纹随 enrich 增长。不跟着刷新的话，新抓到的条目会游离在
+    簇外，前端看到的「几家在报同一件事」永远是上一轮的结论——比不显示更容易误导。
+    """
+
+    result = asyncio.run(_run_dedup(within_days))
+    logger.info("task_dedup_recent_done", extra=result)
+    return result

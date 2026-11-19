@@ -9,7 +9,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -26,6 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import settings
 from app.db.base import Base
 
 
@@ -64,6 +67,10 @@ class Source(Base):
     terms_url: Mapped[str | None] = mapped_column(Text)
     robots_url: Mapped[str | None] = mapped_column(Text)
     rights_note: Mapped[str | None] = mapped_column(Text)
+    # 源的落库授权级别，决定 content_service._store_text 截多少字。
+    # 这一列曾经缺失，导致所有源都吃 SourceSpec 的 dataclass 默认值，
+    # rights_note 那句「全文不入库」其实只是一句注释、没有任何代码效力。
+    rights_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'metadata_excerpt'"))
     # 可信度分层 A/B/C/D，见手册 3.3
     credibility_tier: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'B'"))
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
@@ -124,6 +131,16 @@ class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
         UniqueConstraint("source_id", "external_id", name="uq_documents_source_external"),
+        # 同一来源的同一篇文章只能有一行。external_id 会因为写入路径不同
+        # （feed 的 Atom id / 回填的 URL）而不同，canonical_url 也会因为
+        # feed 给 http、归档页给 https 而不同，但「去掉 scheme 的 URL」是同一个。
+        # 所以身份建在表达式上：scheme 不参与判定。
+        Index(
+            "uq_documents_source_canonical_url",
+            "source_id",
+            text("regexp_replace(canonical_url, '^https?://', '')"),
+            unique=True,
+        ),
         Index("ix_documents_published", text("published_at DESC")),
         Index("ix_documents_fetched", text("fetched_at DESC")),
         Index("ix_documents_hash", "content_hash"),
@@ -175,6 +192,9 @@ class Document(Base):
     content_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # 失败原因：403 与 Timeout 都是 failed，但只有后者值得下一轮重试
     content_error: Mapped[str | None] = mapped_column(Text)
+    # 抓取尝试次数。两个用途：一是决定退避间隔（6h / 24h / 72h），二是让确定性
+    # 失败（403/付费墙）直接把预算烧光——筛选时只比数字，不必再做一遍字符串匹配
+    content_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # SimHash 是 64 位无符号，PG BIGINT 有符号，存十六进制字符串避免符号位来回翻转
     simhash: Mapped[str | None] = mapped_column(Text)
     # 判为转载时指向被转载的原始条目；cluster_id 是同事件聚簇标识（取簇内最早一条的 id）
@@ -208,3 +228,49 @@ class SourceHealthLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     ok: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class DocumentChunk(Base):
+    """正文块的向量索引：**只存向量和位置，不存文本**。
+
+    这张表是「授权」与「召回」的折中产物。`metadata_excerpt` 级别的源只允许存
+    600 字片段，可是长文里真正有用的信息往往在第三段以后。做法是：正文在抓取时
+    在内存里切成块、算成向量，然后把文字丢掉，只留下 384 个浮点数和一个字符区间。
+
+    所以这一列里查不到任何一句原文——它不能用来还原文章，只能回答「哪篇文章的
+    哪一段和你的问题接近」。展示给用户的仍然是标题、摘要和原文链接。
+
+    `model` 必须逐行记录：换模型就等于换向量空间，两种向量混在一张表里做余弦
+    是没有意义的。查询时按 model 过滤，混进了别的模型能被 `group by model` 查出来。
+    """
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "model", "chunk_index", name="uq_document_chunks_doc_model_index"
+        ),
+        # 句向量是 384 维稠密向量，HNSW 让「最近邻」不必全表扫。
+        # 余弦距离对应 vector_cosine_ops，建索引时必须和查询用的算子一致，
+        # 否则索引不会被使用（而且不会报错，只是慢）。
+        Index(
+            "ix_document_chunks_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    # 块在原文中的序号，从 0 起。和 char_start 一起用于告诉用户「命中在第几段」
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

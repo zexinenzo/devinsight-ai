@@ -44,6 +44,7 @@ async def ensure_seed_sources(session: AsyncSession) -> dict[str, int]:
                 robots_url=seed.robots_url,
                 terms_url=seed.terms_url,
                 rights_note=seed.rights_note,
+                rights_mode=seed.rights_mode,
             )
         )
         inserted += 1

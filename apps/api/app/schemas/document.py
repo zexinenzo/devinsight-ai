@@ -21,6 +21,21 @@ class DocumentSourceBrief(BaseModel):
     region: str
 
 
+class DocumentMatch(BaseModel):
+    """语义检索命中说明。
+
+    没有 `text` 字段，也不该有：向量索引库里只存向量和字符区间，原文一个字都没落库
+    （见 `document_chunks` 表注释）。所以这里能给出的只有「多相关」和「在原文的哪个位置」，
+    正文仍然要回原站看——这是授权边界决定的，不是实现偷懒。
+    """
+
+    mode: str
+    # 余弦相似度，1 表示方向一致；None 表示这条只被关键词召回（hybrid 模式）
+    similarity: float | None = None
+    # 最佳命中块在原文字符串里的起点，前端可渲染成「命中在第 1200 字附近」
+    char_start: int | None = None
+
+
 class DocumentListItem(ORMModel):
     id: uuid.UUID
     title: str
@@ -48,6 +63,8 @@ class DocumentListItem(ORMModel):
     cluster_id: uuid.UUID | None = None
     # 同一事件共有几家在报；1 表示只有这一条
     cluster_size: int = 1
+    # 语义检索时才有值；关键词检索返回 null，前端不必据此分支
+    match: DocumentMatch | None = None
     source: DocumentSourceBrief
 
 
