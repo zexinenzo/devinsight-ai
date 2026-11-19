@@ -1,0 +1,267 @@
+{
+  "version": 2,
+  "revision": [
+    "v1 -> v2：收紧了三条标注过宽的 topic 题。t12 原来把「GPL 判决」「开源怎么赚钱」",
+    "算作「国家为什么需要开源」的正确答案，它们只是同一个大主题，并不回答这个问题；",
+    "标注过宽会系统性压低召回指标，让改进看起来比实际无效。t09 反向修正：补入第 138 期",
+    "（失业难以避免），这篇确实在回答该问题，v1 因为标题不含「创业/失业率」被漏掉——",
+    "这是用标题筛 ground truth 的固有偏差，只能靠人工复核补。"
+  ],
+  "created_at": "2026-11-19",
+  "corpus": "1431 篇文档；其中 737 篇有可索引正文（阮一峰 390 篇全文 + HN 347 篇 600 字片段）",
+  "note": [
+    "ground truth 用标题子串而不是 document_id：换库、重建、换机器之后评测集仍然可用，",
+    "而且看 JSON 就能判断标注对不对，不用回头查 UUID。",
+    "标注原则：一篇文档被列为正确答案，条件是它的内容能实质回答该问题，",
+    "而不是仅仅出现过某个关键词——所以『提到了』不算命中。",
+    "问题措辞刻意不复用标题原词（尤其是 topic 类），否则测出来的是标题匹配，不是语义检索。"
+  ],
+  "types": {
+    "fact": "单篇具体事实，答案在正文里，考『能不能定位到那一篇』",
+    "topic": "多篇主题，答案不唯一，考『能不能召回同一主题的一组文章』",
+    "named": "专有名词，考『字面匹配』——这一档 keyword 本该强，如果它输了说明索引有问题",
+    "en": "英文语料（HN，正文只有 600 字片段），单独报告，不与中文混算"
+  },
+  "questions": [
+    {
+      "id": "f01",
+      "type": "fact",
+      "q": "27 寸的 4K 显示器一个月大概要用掉多少度电",
+      "expect": ["第 230 期"]
+    },
+    {
+      "id": "f02",
+      "type": "fact",
+      "q": "GPT-3 一共有多少参数",
+      "expect": ["第 253 期"]
+    },
+    {
+      "id": "f03",
+      "type": "fact",
+      "q": "何小鹏当时担心什么情况会导致整车厂停产",
+      "expect": ["第 207 期"]
+    },
+    {
+      "id": "f04",
+      "type": "fact",
+      "q": "学术型硕士和专业型硕士有什么不同，MBA 属于哪一种",
+      "expect": ["第 161 期"]
+    },
+    {
+      "id": "f05",
+      "type": "fact",
+      "q": "疫情期间美国的个人储蓄率从多少涨到了多少",
+      "expect": ["第 143 期"]
+    },
+    {
+      "id": "f06",
+      "type": "fact",
+      "q": "哪种迷你电脑自带 128GB 内存，卖两万块左右",
+      "expect": ["第 404 期"]
+    },
+    {
+      "id": "f07",
+      "type": "fact",
+      "q": "软件开发里的『大教堂』模式指的是什么做法",
+      "expect": ["第 395 期"]
+    },
+    {
+      "id": "f08",
+      "type": "fact",
+      "q": "普通人有没有可能在三十多岁就不用为生计工作了",
+      "expect": ["第 191 期"]
+    },
+    {
+      "id": "f09",
+      "type": "fact",
+      "q": "流浪猫进猫窝用的刷脸设备能认出多少种猫",
+      "expect": ["第 46 期"]
+    },
+    {
+      "id": "f10",
+      "type": "fact",
+      "q": "低代码平台为什么可能做不成",
+      "expect": ["第 341 期"]
+    },
+    {
+      "id": "f11",
+      "type": "fact",
+      "q": "软件开发除了大教堂模式，另一个模式叫什么",
+      "expect": ["第 395 期"]
+    },
+    {
+      "id": "f12",
+      "type": "fact",
+      "q": "一个人的知识应该往宽里走还是往深里走",
+      "expect": ["第 175 期"]
+    },
+    {
+      "id": "f13",
+      "type": "fact",
+      "q": "如果把模型权重公开给别人自己部署，之前投进去的巨额资金会有什么风险",
+      "expect": ["第 407 期"]
+    },
+    {
+      "id": "t01",
+      "type": "topic",
+      "q": "不靠卖许可证，软件项目还能怎么养活自己",
+      "expect": ["第 263 期", "第 407 期", "第 176 期"]
+    },
+    {
+      "id": "t02",
+      "type": "topic",
+      "q": "为什么现在手机电池容量突然都变大了",
+      "expect": ["第 354 期", "第 229 期"]
+    },
+    {
+      "id": "t03",
+      "type": "topic",
+      "q": "燃油车会不会被淘汰，最后谁能活下来",
+      "expect": ["第 149 期"]
+    },
+    {
+      "id": "t04",
+      "type": "topic",
+      "q": "加密聊天软件还差哪一步才能彻底防住窃听",
+      "expect": ["第 274 期", "第 262 期"]
+    },
+    {
+      "id": "t05",
+      "type": "topic",
+      "q": "现在做互联网创业还有机会吗",
+      "expect": ["第 337 期", "第 302 期", "第 235 期", "第 129 期"]
+    },
+    {
+      "id": "t06",
+      "type": "topic",
+      "q": "写代码这份工作以后还会不会存在",
+      "expect": ["第 409 期", "第 341 期"]
+    },
+    {
+      "id": "t07",
+      "type": "topic",
+      "q": "国内法院对开源许可证的法律效力是什么态度",
+      "expect": ["第 176 期"]
+    },
+    {
+      "id": "t08",
+      "type": "topic",
+      "q": "为什么越来越多的公司想自己在机房里跑模型",
+      "expect": ["第 407 期"]
+    },
+    {
+      "id": "t09",
+      "type": "topic",
+      "q": "年轻人找不到工作和自己去干点什么之间的关系",
+      "expect": ["第 235 期", "第 302 期", "第 337 期", "第 138 期"]
+    },
+    {
+      "id": "t10",
+      "type": "topic",
+      "q": "手机充电这件事现在解决到什么程度了",
+      "expect": ["第 229 期", "第 354 期"]
+    },
+    {
+      "id": "t11",
+      "type": "topic",
+      "q": "一家互联网公司到底需要养多少人",
+      "expect": ["第 231 期"]
+    },
+    {
+      "id": "t12",
+      "type": "topic",
+      "q": "开源软件对一个国家意味着什么",
+      "expect": ["第 407 期"]
+    },
+    {
+      "id": "n01",
+      "type": "named",
+      "q": "Strix Halo",
+      "expect": ["第 404 期"]
+    },
+    {
+      "id": "n02",
+      "type": "named",
+      "q": "何小鹏",
+      "expect": ["第 207 期"]
+    },
+    {
+      "id": "n03",
+      "type": "named",
+      "q": "李飞飞",
+      "expect": ["第 348 期"]
+    },
+    {
+      "id": "n04",
+      "type": "named",
+      "q": "Product Hunt",
+      "expect": ["第 307 期"]
+    },
+    {
+      "id": "n05",
+      "type": "named",
+      "q": "GPT-4 参数量",
+      "expect": ["第 253 期"]
+    },
+    {
+      "id": "n06",
+      "type": "named",
+      "q": "阮一峰 第 81 期",
+      "expect": ["第 81 期"]
+    },
+    {
+      "id": "e01",
+      "type": "en",
+      "q": "how can an AI coach help me negotiate a lower internet bill",
+      "expect": ["Claude coach me through a call"]
+    },
+    {
+      "id": "e02",
+      "type": "en",
+      "q": "audio decoders that run faster than ffmpeg",
+      "expect": ["FLAC, MP3 and DST decoders"]
+    },
+    {
+      "id": "e03",
+      "type": "en",
+      "q": "huge outage that took down banks and airports",
+      "expect": ["Widespread outages hit banks"]
+    },
+    {
+      "id": "e04",
+      "type": "en",
+      "q": "java base64 handling remote code execution flaw",
+      "expect": ["Java4Shell"]
+    },
+    {
+      "id": "e05",
+      "type": "en",
+      "q": "send failed vercel deployments to a coding agent automatically",
+      "expect": ["Spooky Particles"]
+    },
+    {
+      "id": "e06",
+      "type": "en",
+      "q": "browser mmo game that an AI agent plays over MCP",
+      "expect": ["Space-Core"]
+    },
+    {
+      "id": "e07",
+      "type": "en",
+      "q": "php 8.6 new features partial function application",
+      "expect": ["PHP 8.6 GA"]
+    },
+    {
+      "id": "e08",
+      "type": "en",
+      "q": "google gemini 4 neon model release",
+      "expect": ["Gemini 4 Neon"]
+    },
+    {
+      "id": "e09",
+      "type": "en",
+      "q": "oauth client id metadata document internet draft",
+      "expect": ["OAuth Client ID Metadata Document"]
+    }
+  ]
+}

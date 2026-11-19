@@ -28,3 +28,7 @@ output/
 *.docx
 # docs/tools/build_html.py 的产物，255 KB，随时能由 md 重新生成
 docs/tools/formatted-technical-manual.html
+
+# 评测结果（一条命令可重跑，不入库）；题库本身必须入库，否则评测失去意义
+apps/api/data/eval_*.json
+!apps/api/data/eval_questions.json

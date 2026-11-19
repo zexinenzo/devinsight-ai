@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Select, String, cast, func, literal, or_, select, tuple_
+from sqlalchemy import Select, String, case, cast, func, literal, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -30,6 +31,106 @@ VECTOR_CANDIDATES = 300
 # RRF 的平滑常数。取 60 是检索界的经验值：它让排名靠后的结果仍然有非零贡献，
 # 但不会让「第 50 名」压过「第 1 名」。
 RRF_K = 60
+# 文档级聚合取前几个块的平均距离。3 是在评测集上调出来的：取 1 就退化成单块信号，
+# 取 5 会把「只有开头提到一句」的长文拉得太低。5 个块约占一篇周刊的三分之一。
+DOC_AGG_TOP_N = 3
+
+# 中文没有空格，整句 ILIKE 对自然语言问句是结构性失效：用户打一句
+# 「GPT-3 一共有多少参数」，这句话不可能整体出现在任何标题里，注定 0 结果。
+# 评测集上 keyword 模式的 fact / topic / en 三类得分全是 0.000，就是这个原因，
+# 与「正文没有索引」无关——那条只解释短句为什么也搜不到。
+#
+# 兜底方案是把问句切成片段做 OR 匹配：英文按词、中文按相邻两字。
+# 这些片段是纯虚词组合，命中它们不说明任何相关性，先剔掉。
+_STOP_BIGRAMS = frozenset(
+    {
+        "一个", "这个", "那个", "我们", "你们", "他们", "就是", "不是", "可以", "什么",
+        "怎么", "如何", "多少", "有没", "没有", "这些", "那些", "因为", "所以", "但是",
+        "如果", "已经", "现在", "时候", "之间", "以及", "或者", "而且", "然后", "还是",
+    }
+)
+_EN_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+#_-]*")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _keyword_terms(q: str, *, max_terms: int = 12) -> list[str]:
+    """把一段自然语言切成可用于 ILIKE 的片段。
+
+    截断规则不是「取前 12 个」——那样会把句尾的关键词全部丢掉。实测：
+    「27 寸的 4K 显示器一个月大概要用掉多少度电」按顺序取前 12 个，
+    恰好把最关键的「度电」切掉了，而它才是区分这台显示器和别的显示器的词。
+    改成先留英文/数字词，剩余名额在同长度的中文二元组上**均匀采样**，
+    保证片段覆盖整句话而不是只覆盖开头。
+    """
+
+    english: list[str] = []
+    for match in _EN_TOKEN_RE.finditer(q):
+        token = match.group(0)
+        if len(token) >= 2:
+            english.append(token)
+
+    cjk: list[str] = []
+    for match in _CJK_RUN_RE.finditer(q):
+        run = match.group(0)
+        for position in range(len(run) - 1):
+            bigram = run[position : position + 2]
+            if bigram not in _STOP_BIGRAMS:
+                cjk.append(bigram)
+
+    # 英文词最多占一半名额：它们是完整单词，区分度高，但也要给中文留位置
+    english = english[: max(1, max_terms // 2)]
+    budget = max_terms - len(english)
+    if len(cjk) > budget > 1:
+        # 采样点包含首尾两个端点，否则句尾的二元组永远取不到
+        last = len(cjk) - 1
+        cjk = [cjk[round(index * last / (budget - 1))] for index in range(budget)]
+    elif len(cjk) > budget == 1:
+        cjk = cjk[-1:]
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for term in [*english, *cjk]:
+        if term not in seen:
+            seen.add(term)
+            ordered.append(term)
+    return ordered[:max_terms]
+
+
+def _keyword_condition(q: str, *, fallback: bool = True):
+    """整句优先，片段兜底。
+
+    整句命中的精确度最高，保留它意味着短词查询（「移动支付」）的行为不变。
+    片段匹配只在整句没有结果时才有机会被选中——注意这是同一条 SQL 里的 OR，
+    不是两次查询：命中数阈值定在 `max(2, 片段数 × 0.4)`，只有同时命中
+    足够多片段的文档才算相关，避免「搜一句话返回全库」。
+
+    **`fallback=False` 给 hybrid 用。** 这是个踩过的坑：片段兜底让 keyword 模式
+    自己的 R@5 从 0.100 涨到 0.460，但把它接进 RRF 之后，hybrid 的英文类反而从
+    0.744 掉到 0.522——片段匹配对英文问句会召回大量「含这个词但不是这个意思」的
+    文档，RRF 只看名次不看质量，噪音直接把向量结果挤下去。
+    职责要分清：片段兜底是给纯关键词模式用的（用户只打关键词时不该 0 结果），
+    hybrid 里关键词那一路只需要负责精确串（人名、版本号、专有名词），其余交给向量。
+    """
+
+    statement_q = q.strip()
+    exact = or_(
+        Document.title.ilike(f"%{statement_q}%"),
+        Document.summary.ilike(f"%{statement_q}%"),
+    )
+    if not fallback:
+        return exact
+    terms = _keyword_terms(statement_q)
+    if len(terms) < 2:
+        return exact
+
+    hits = None
+    for term in terms:
+        one = case((Document.title.ilike(f"%{term}%"), 1), else_=0) + case(
+            (Document.summary.ilike(f"%{term}%"), 1), else_=0
+        )
+        hits = one if hits is None else hits + one
+    threshold = max(2, int(len(terms) * 0.4))
+    return or_(exact, hits >= threshold)
 
 
 def _encode_cursor(kind: str, value, document_id: uuid.UUID) -> str:
@@ -99,10 +200,10 @@ def _apply_filters(
     content_type: str | None = None,
     published_from: datetime | None = None,
     published_to: datetime | None = None,
+    q_fallback: bool = True,
 ) -> Select:
-    if q:
-        pattern = f"%{q.strip()}%"
-        statement = statement.where(or_(Document.title.ilike(pattern), Document.summary.ilike(pattern)))
+    if q and q.strip():
+        statement = statement.where(_keyword_condition(q, fallback=q_fallback))
     if source_key:
         statement = statement.where(Source.source_key == source_key)
     if region:
@@ -323,6 +424,89 @@ async def _vector_hits(
     return [(row[0], float(row[1]), int(row[2])) for row in rows]
 
 
+async def _document_vector_hits(
+    session: AsyncSession,
+    *,
+    query_vector: list[float],
+    model: str,
+    source_key: str | None,
+    region: str | None,
+    language: str | None,
+    topic: str | None,
+    content_type: str | None,
+    published_from: datetime | None,
+    published_to: datetime | None,
+    include_reposts: bool,
+    limit: int,
+) -> list[uuid.UUID]:
+    """按文档聚合前 N 块的平均距离，返回文档 ID 顺序。
+
+    **为什么需要这一路信号。** `_vector_hits` 取的是每篇文档**最相近的那一块**，
+    这对"定位型"问题是优点（"GPT-3 有多少参数"只要有一块讲到就够），但对
+    "主题型"问题是噪声：一篇顺带提到该主题的文章，只要某一块恰好和问题很像，
+    就能顶掉整篇都在讲这个主题的周刊。
+
+    评测集量出来的数字印证了这一点——单块信号在 fact 类上是 0.923，
+    在 topic 类上只有 0.465。差别不在模型，在聚合方式。
+
+    取前 3 块的平均值，等于要求"这篇文章有多处都在讲这件事"。
+    代价是定位型会略降（只有一个块相关时被其他块拉低），所以它**不替代**
+    单块信号，只作为 hybrid 里的一路独立信号参与 RRF——两者的偏好正好互补：
+    单块管"精准命中一处"，聚合管"整篇都在讲"。
+    """
+
+    distance = DocumentChunk.embedding.cosine_distance(
+        cast(
+            literal(embedding_service.to_vector_literal(query_vector), String),
+            Vector(settings.embedding_dimensions),
+        )
+    )
+    # 距离先在子查询里算一次，外层只引用列。写成 row_number() over (order by <distance 表达式>)
+    # 会让 Postgres 对每一行重算余弦距离——同一行算两遍，白烧一次 CPU。
+    scored = (
+        select(DocumentChunk.document_id.label("document_id"), distance.label("distance"))
+        .where(DocumentChunk.model == model)
+        .subquery()
+    )
+    ranked = (
+        select(
+            scored.c.document_id,
+            scored.c.distance,
+            func.row_number()
+            .over(partition_by=scored.c.document_id, order_by=scored.c.distance)
+            .label("rn"),
+        )
+        .subquery()
+    )
+    aggregated = (
+        select(ranked.c.document_id, func.avg(ranked.c.distance).label("distance"))
+        .where(ranked.c.rn <= DOC_AGG_TOP_N)
+        .group_by(ranked.c.document_id)
+        .subquery()
+    )
+
+    statement = _apply_filters(
+        select(aggregated.c.document_id)
+        .join(Document, Document.id == aggregated.c.document_id)
+        .join(Source, Source.id == Document.source_id),
+        # 与 _vector_hits 同理：语义检索不吃 ILIKE
+        q=None,
+        source_key=source_key,
+        region=region,
+        language=language,
+        topic=topic,
+        content_type=content_type,
+        published_from=published_from,
+        published_to=published_to,
+    )
+    if not include_reposts:
+        statement = statement.where(Document.dup_of.is_(None))
+
+    statement = statement.order_by(aggregated.c.distance).limit(limit)
+    rows = (await session.execute(statement)).all()
+    return [row[0] for row in rows]
+
+
 async def _keyword_hits(
     session: AsyncSession,
     *,
@@ -340,6 +524,9 @@ async def _keyword_hits(
     statement = _apply_filters(
         select(Document.id).join(Source, Document.source_id == Source.id),
         q=q,
+        # hybrid 的关键词那一路只取精确串：片段兜底会带来语义无关的噪音，
+        # 而 RRF 只看名次，压不住它。自然语言问句交给向量那一路。
+        q_fallback=False,
         source_key=source_key,
         region=region,
         language=language,
@@ -437,7 +624,23 @@ async def _semantic_page(
             include_reposts=include_reposts,
             limit=limit * 2,
         )
-        ordered = _reciprocal_rank_fusion(ordered, keyword_ids)
+        # 第三路：文档级聚合。单块信号认「某一处很像」，聚合信号认「整篇都在讲」，
+        # 评测集上两者在 fact / topic 两类的偏好正好互补，所以都参与融合而不是二选一。
+        aggregate_ids = await _document_vector_hits(
+            session,
+            query_vector=query_vector,
+            model=embedder.name,
+            source_key=source_key,
+            region=region,
+            language=language,
+            topic=topic,
+            content_type=content_type,
+            published_from=published_from,
+            published_to=published_to,
+            include_reposts=include_reposts,
+            limit=VECTOR_CANDIDATES,
+        )
+        ordered = _reciprocal_rank_fusion(ordered, keyword_ids, aggregate_ids)
 
     page_ids = ordered[:limit]
     if not page_ids:
