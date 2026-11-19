@@ -10,7 +10,9 @@ import html
 import re
 from pathlib import Path
 
-SRC = Path(__file__).parent.parent / "stage1" / "final_draft.md"
+# 源文件就在上级目录（docs/ 下），不是当初流水线里的 stage1/final_draft.md。
+# 旧写法依赖 output/<request_id>/stage1/ 那套布局，脱离了那个目录就 FileNotFoundError。
+SRC = Path(__file__).parent.parent / "从零搭建多源情报采集系统.md"
 OUT = Path(__file__).with_name("formatted-technical-manual.html")
 
 CSS = """

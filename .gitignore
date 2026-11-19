@@ -26,3 +26,5 @@ out/
 # 文档产物（二进制，走 Release 附件）
 output/
 *.docx
+# docs/tools/build_html.py 的产物，255 KB，随时能由 md 重新生成
+docs/tools/formatted-technical-manual.html
