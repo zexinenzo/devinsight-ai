@@ -16,12 +16,13 @@ from sqlalchemy import func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.connectors.base import SourceSpec
+from app.connectors.base import NO_FETCH_SOURCES, SourceSpec
 from app.connectors.registry import get_connector
 from app.core.config import settings
 from app.core.errors import RateLimitedError
 from app.core.logging import get_logger
 from app.db.models import Document, IngestionRun, Source, SourceHealthLog
+from app.utils.engagement import normalize_engagement
 
 logger = get_logger(__name__)
 
@@ -111,6 +112,16 @@ def _document_rows(source: Source, documents) -> list[dict]:
                 "content_hash": document.content_hash,
                 "rights_mode": document.rights_mode,
                 "quality_flags": document.quality_flags,
+                "engagement_raw": document.engagement or {},
+                "engagement_score": normalize_engagement(document.engagement),
+                # Connector 能在内存里拿到全文时就已经算好指纹（36氪这类）。
+                # 拿到指纹的条目正文来源是 feed 本身，不该再进网页抓取队列——
+                # 那些页面要么是 SPA、要么直接 403，重试只是浪费请求额度。
+                "simhash": document.fingerprint,
+                # 抓不到的源直接标 from_feed：留在 pending 会成为一个永远不变
+                # 的死状态，前端一直显示「尚未补全正文」，而它根本不会被抓。
+                "content_status": document.content_status
+                or ("from_feed" if source.source_key in NO_FETCH_SOURCES else "pending"),
             }
         )
     return rows

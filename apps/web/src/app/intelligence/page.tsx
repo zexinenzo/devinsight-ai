@@ -42,10 +42,27 @@ const FLAG_LABELS: Record<string, string> = {
   missing_url: "缺原文链接",
   self_post: "自帖",
   prerelease: "预发布",
+  content_failed: "正文抓取失败",
+  content_empty: "原文无正文",
+  content_from_meta: "正文仅描述",
 };
 
 function flagLabel(flag: string): string {
   return FLAG_LABELS[flag] ?? flag;
+}
+
+/**
+ * 热度文案。各源的指标口径不同，不能统一显示成一个数字：
+ * HN 是投票数，GitHub 是版本附件的下载量。统一成「热度 3.2」对读者没有意义。
+ */
+function engagementLabel(raw: Record<string, number> | null | undefined): string | null {
+  if (!raw) return null;
+  if (typeof raw.score === "number") {
+    const comments = typeof raw.comments === "number" ? ` · ${raw.comments} 评论` : "";
+    return `${raw.score} 票${comments}`;
+  }
+  if (typeof raw.downloads === "number") return `${raw.downloads.toLocaleString("zh-CN")} 次下载`;
+  return null;
 }
 
 function buildHref(params: Record<string, string | undefined>, patch: Record<string, string | undefined>) {
@@ -66,9 +83,17 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
   const tier = TIER_STYLE[document.source.credibility_tier] ?? TIER_STYLE.B;
   const contentType = CONTENT_TYPE_STYLE[document.content_type];
   const isPaper = document.content_type === "paper";
-  const flags = document.quality_flags.map(flagLabel);
+  // 摘要缺失的徽章不必和抓取状态重复。状态是 failed / empty 时，下面那句提示已经
+  // 说清楚「为什么没有摘要」，再挂一个「缺摘要」只是把同一件事说两遍。
+  const flags = document.quality_flags
+    .filter(
+      (flag) =>
+        !(flag === "missing_summary" && ["failed", "empty"].includes(document.content_status)),
+    )
+    .map(flagLabel);
   const visibleFlags = flags.slice(0, 2);
   const hiddenFlagCount = flags.length - visibleFlags.length;
+  const engagement = engagementLabel(document.engagement_raw);
 
   return (
     <article className="rounded-xl border border-zinc-200 bg-white p-5 transition hover:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-zinc-700">
@@ -80,6 +105,30 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
         <span className={`rounded px-1.5 py-0.5 font-medium ${tier.className}`}>{tier.label}</span>
         <span className="text-zinc-400">{document.region === "cn" ? "中国" : "全球"}</span>
         {document.language && <span className="uppercase text-zinc-400">{document.language}</span>}
+        {engagement && (
+          <span
+            className="rounded bg-rose-50 px-1.5 py-0.5 font-medium text-rose-700 dark:bg-rose-950 dark:text-rose-300"
+            title="来自源站的互动数据，用于决定是否优先补全正文"
+          >
+            {engagement}
+          </span>
+        )}
+        {document.dup_of && (
+          <span
+            className="rounded bg-zinc-200 px-1.5 py-0.5 font-medium text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300"
+            title="正文与更早的一条高度相似，判为转载；列表默认隐藏这类副本"
+          >
+            转载
+          </span>
+        )}
+        {document.cluster_size > 1 && (
+          <span
+            className="rounded bg-indigo-50 px-1.5 py-0.5 font-medium text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300"
+            title="同一事件有多家来源在报道"
+          >
+            {document.cluster_size} 家报道
+          </span>
+        )}
         {visibleFlags.map((flag) => (
           <span
             key={flag}
@@ -114,8 +163,19 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
           {document.summary}
         </p>
       ) : (
-        <p className="mt-2 text-sm italic leading-6 text-zinc-400 dark:text-zinc-500">
-          原文未提供摘要 —— 正文需抓取原文后补全
+        <p
+          className="mt-2 text-sm italic leading-6 text-zinc-400 dark:text-zinc-500"
+          title={document.content_error ?? undefined}
+        >
+          {document.content_status === "fetched"
+            ? "正文已补全，但该源未提供摘要"
+            : document.content_status === "from_feed"
+              ? "该源未提供摘要（上游只给了标题）"
+              : document.content_status === "failed"
+                ? "原文站点拒绝抓取（反爬或付费墙），摘要不可用 —— 点标题可直接读原文"
+                : document.content_status === "empty"
+                  ? "原文页面没有可抽取的正文（前端渲染或付费墙）"
+                  : "尚未补全正文 —— 跑 make enrich 按热度抓取"}
         </p>
       )}
 
@@ -124,6 +184,14 @@ function DocumentCard({ document }: { document: DocumentListItem }) {
         <span>
           采集 {formatDateTime(document.fetched_at)}（{formatRelative(document.fetched_at)}）
         </span>
+        {document.content_status === "from_feed" && (
+          <span
+            className="rounded bg-sky-50 px-1.5 py-0.5 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+            title="该源在订阅源或接口里已直接提供文本，不需要再抓网页；其中部分源（如 36氪）的正文页是前端渲染的，抓也抓不到"
+          >
+            源自上游
+          </span>
+        )}
         {document.topics.map((topic) => (
           <Link
             key={topic}
@@ -153,6 +221,7 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
     topic: pick(raw, "topic"),
     content_type: pick(raw, "content_type"),
   };
+  const sort = pick(raw, "sort") === "engagement" ? "engagement" : "time";
 
   let items: DocumentListItem[] = [];
   let total = 0;
@@ -164,7 +233,7 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
 
   try {
     const [page, sourceList, topicList, typeList] = await Promise.all([
-      listDocuments({ ...filters, limit: 20, cursor: pick(raw, "cursor") }),
+      listDocuments({ ...filters, sort, limit: 20, cursor: pick(raw, "cursor") }),
       listSources(),
       listTopics(),
       listContentTypes(),
@@ -185,10 +254,43 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">情报流</h1>
           <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-            {errorMessage ? "后端未就绪" : `共 ${total} 条，按发布时间倒序（无发布时间按采集时间排序）`}
+            {errorMessage
+              ? "后端未就绪"
+              : sort === "engagement"
+                ? `共 ${total} 条，按热度倒序 —— 没有互动数据的源（RSS、arXiv）排在后面`
+                : `共 ${total} 条，按发布时间倒序（无发布时间按采集时间排序）`}
           </p>
         </div>
+        <div className="flex items-center gap-1 rounded-md border border-zinc-300 p-0.5 text-xs dark:border-zinc-700">
+          {(
+            [
+              { key: "time", label: "按时间" },
+              { key: "engagement", label: "按热度" },
+            ] as const
+          ).map((option) => (
+            <Link
+              key={option.key}
+              href={buildHref({ ...filters, sort: option.key }, {})}
+              className={`rounded px-2.5 py-1.5 font-medium transition ${
+                sort === option.key
+                  ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
+                  : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              }`}
+            >
+              {option.label}
+            </Link>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <p className="text-xs text-zinc-400 dark:text-zinc-500">
+          列表默认隐藏转载副本（同一篇稿子被多站转走时只保留最早的一条）
+        </p>
         <form method="get" className="flex flex-wrap items-center gap-2 text-sm">
+          {/* 筛选表单提交时会丢掉不在表单里的参数，排序方式必须显式带上，
+              否则用户按热度看完再改筛选，会静默跳回按时间 */}
+          <input type="hidden" name="sort" value={sort} />
           <input
             type="search"
             name="q"
@@ -283,7 +385,7 @@ async function IntelligenceBoard({ searchParams }: { searchParams: SearchParams 
       {nextCursor && (
         <div className="flex justify-center pt-2">
           <Link
-            href={buildHref(filters, { cursor: nextCursor })}
+            href={buildHref({ ...filters, sort }, { cursor: nextCursor })}
             className="rounded-md border border-zinc-300 px-4 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
             下一页

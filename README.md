@@ -3,15 +3,16 @@
 科技产业情报平台：从中国与全球公开、合规的数据源持续采集科技新闻、官方发布、开源动态与论文，
 把原始信息转化为可检索、可追溯的情报。
 
-当前进度：**阶段 0（工程骨架）+ 阶段 1（来源注册与 RSS）**已跑通，即手册 14.1 要求的
-「第一条真实数据闭环」：
+当前进度：**阶段 0（工程骨架）+ 阶段 1（来源注册与 RSS）+ 阶段 2（多源 API）+ 阶段 3（正文补全与去重）**
+已跑通，即手册 14.1 要求的「第一条真实数据闭环」：
 
 ```
-36氪 RSS / InfoQ RSS / OpenAI News RSS
-  -> RSS Connector（解析 / 清洗 / 去重 / 分类）
-  -> PostgreSQL documents
-  -> FastAPI GET /api/v1/documents
-  -> Next.js /intelligence 情报流
+9 个启用源（3 RSS + HN + 3 GitHub 仓库 + arXiv）
+  -> Connector 抓取 / 解析 / 清洗 / 分类 / 增量
+  -> PostgreSQL documents（幂等入库）
+  -> engagement 回填热度 -> enrich 按热度抓正文 + SimHash -> dedup 判转载 / 聚事件
+  -> FastAPI GET /api/v1/documents（支持 sort=engagement）
+  -> Next.js /intelligence 情报流（按时间 / 按热度、事件簇、抓取状态）
 ```
 
 ## 技术栈
@@ -31,12 +32,21 @@ make up
 make migrate
 make seed
 
-# 3. 真实采集一轮（8 个启用来源：3 个 RSS + HN + 3 个 GitHub 仓库 + arXiv）
+# 3. 真实采集一轮（9 个启用来源：3 个 RSS + HN + 3 个 GitHub 仓库 + arXiv）
 make sync
 make status        # 看健康状态与最近批次
 make docs          # 看最新入库情报
 
-# 4. 启动服务（两个终端）
+# 4. 补正文与判重（阶段 3）
+make engagement    # 回填 HN 热度；存量数据必须先跑，否则 enrich 退化成按时间挑
+make refingerprint # 用新解析逻辑修正存量（默认只处理 RSS；ALL=1 覆盖 API 源，会耗额度）
+make enrich        # 按热度抓正文、算 SimHash、补摘要（默认 30 条，每源 10 条）
+make dedup         # 判转载 + 聚同事件（默认 30 天窗口）
+
+# 采集完顺手补一轮摘要（HN 这类上游只给标题的源必须这么做）
+cd apps/api && python -m app.cli sync --source hackernews_en --enrich 40
+
+# 5. 启动服务（两个终端）
 make api           # http://localhost:8000/docs
 make web           # http://localhost:3000/intelligence
 
@@ -54,7 +64,7 @@ make beat          # 每 5 分钟派发到期来源
 | GET | `/api/v1/sources/{id}` | 来源详情 |
 | GET | `/api/v1/sources/{id}/health` | 最近 10 次 run + 20 条健康日志 |
 | POST | `/api/v1/admin/sources/{id}/sync` | 手动触发同步（优先入 Celery，broker 不可用则进程内执行） |
-| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/limit/cursor` |
+| GET | `/api/v1/documents` | 情报列表：`q/source/region/language/topic/content_type/from/to/sort/limit/cursor` |
 | GET | `/api/v1/documents/{id}` | 文档详情 |
 | GET | `/api/v1/meta/topics` | 六大领域字典 |
 | GET | `/api/v1/meta/content-types` | 内容类型分布（只列库里真实存在的类型，带条数） |
@@ -131,6 +141,96 @@ arXiv 是另一类约束：它**不给任何退避线索**。超限时 Google Fr
 
 arXiv 还要求 User-Agent 里能联系到人，否则限流阈值更严。`.env` 里的 `HTTP_USER_AGENT` 默认带一个占位邮箱，正式跑之前建议改成真实地址。
 
+## 正文补全与去重（阶段 3）
+
+### 为什么不是「全都抓」
+
+抓正文要下载 HTML、解析 DOM、清洗、算指纹，单条成本比采集元数据高一个量级。对全部条目都抓，
+总成本等于条目数乘以单页成本，而其中大部分内容既没人看、也不会被检索到。
+
+「热门」必须落成可排序的字段，否则代码里没有任何东西能执行这条规则。热度只取上游自带的互动数据：
+
+| 源 | 信号 | 归一 |
+|---|---|---|
+| Hacker News | `score` + `descendants` | `log1p(score)` |
+| GitHub Release | 附件 `download_count` 之和 | `log1p(downloads)` |
+| arXiv / RSS | 无 | 返回 `None`（**不是 0**），排序时走 `nulls_last` 兜底 |
+
+不做跨源归一：HN 几百票、GitHub 几十万次下载，硬压到同一区间会变成「下载量永远第一」。
+实际选取按源分组取前 N（`row_number() over (partition by source_id)`），只需要源内排序正确。
+
+### 新列的存量数据是个坑
+
+`engagement_score` 是阶段 3 新加的列，此前入库的 611 条全是 `NULL`。`NULL` 被 `nulls_last`
+统一推到末尾，于是「按热度抓」实际执行的是「按时间抓」。增量同步也补不上——这些条目已存在，会被唯一约束跳过。
+
+所以有独立的一步 `make engagement`：回访 HN 的 item 接口刷新 `score`/`descendants`。实测 255 条、8 并发、
+**10.2 秒**回填 250 条（其余 5 条分值本身最新）。热度**只增不减**：HN 的分数会随时间下降，
+而「值不值得抓」应该看历史最高关注度。
+
+只回填 HN：GitHub 的下载量只能靠拉整个 release 响应拿到，匿名配额 60 次/小时，给 60 条各发一次就会
+耗尽额度、连带影响正常同步。
+
+### 抓取：三态而不是两态
+
+| 状态 | 含义 | 重试 |
+|---|---|---|
+| `fetched` | 拿到正文或描述 | — |
+| `empty` | 页面确实没有可抽取的正文（SPA、付费墙、纯图片） | 无意义，永久跳过 |
+| `failed` | 网络错误 / 4xx / 429，原因写进 `content_error` | 手动改回 `pending` 才重试 |
+
+混成一个 `failed` 会让「失败率」失去意义。抓到的正文按 `rights_mode` 决定落库长度：媒体源只存 600 字符
+（全文只用于在内存里算指纹与提摘要），`full_text` / `public_domain` 存到 20000 字符。
+
+### 判重：两个阈值都是实测出来的
+
+| 判据 | 输入 | 阈值 | 结论 |
+|---|---|---|---|
+| SimHash 汉明距离 | 正文 | ≤ 10 / 64 位 | 转载，`dup_of` 指向最早那条 |
+| 标题 token Jaccard | 标题 | ≥ 0.35、48h 内、**必须跨源** | 同事件，聚成一簇 |
+
+实测依据：中文正文转载（改标题、加尾注、约 20 个 bigram 变动）距离是 **8**，无关文章 **34 以上**，
+所以阈值取 10 而不是教科书的 3——守着 3 会把真实转载全部漏掉。事件聚类方面，同事件不同措辞的
+Jaccard 是 **0.44~0.67**，无关事件是 **0.07**，取 0.35 落在空档中间。
+
+两个反直觉的约束都是撞出来的：
+
+- **必须跨源**：只按标题相似度聚，OpenAI 同一天的两条公告（ChatGPT Images / ChatGPT for Financial
+  Services）会被聚成「同一事件」。这个簇要回答的是「这件事有几家媒体在报」，同源发两次不算。
+- **`release` 不参与聚类**：GitHub 相邻版本标题只差最后一位数字，Jaccard 0.9 以上，
+  `v0.40.8`~`v0.40.11` 会被聚成一起事件。这是定义问题，调阈值救不了。
+
+先判转载再聚类，顺序不能反：否则转载副本会被当成「另一家媒体的报道」，把簇大小撑虚。
+
+### 实测：1011 条语料上的抓取结果
+
+| 源 | 状态 | 摘要覆盖率 |
+|---|---|---|
+| Hacker News | 372 `fetched` / 40 `from_feed` / 228 `failed` / 15 `empty` | 417 / 655（64%） |
+| arXiv | 50 条 `from_feed` | 50 / 50（均值 1453 字） |
+| GitHub Release ×3 | 60 条 `from_feed` | 60 / 60，只有 Notes 摘要，正文在 GitHub |
+| 36氪 | 30 条 `from_feed` | 30 / 30，**RSS 自带全文**（3414~14173 字），但 `rights_note` 规定全文不入库，只用来算指纹 |
+| InfoQ | 16 条 `from_feed` | 16 / 16，正文页 `HTTP 405` |
+| OpenAI News | 200 条 `from_feed` | 199 / 200，正文页 Cloudflare `HTTP 403` |
+
+全库 1011 条，772 条有摘要（76%），363 条有指纹。
+
+**HN 的 64% 是本阶段的主要修复。** 修之前是 11%（28/255），三个原因叠在一起：上游只给标题（`item.text` 只对 Ask HN 自帖有值）；抓到的正文被写进 `content_text` 却没写进 `summary`，而前端只读 `summary`；227 条待抓的一直没轮到处理。补摘要的优先级是「feed 摘要 > 页面 `og:description` > 正文首段」，正文首段要跳过署名行、与标题相同的段落、以及「INSIDE Deutsche Bank」这类界面残渣。
+
+228 条失败里 136 条是**本机代理对特定域名的策略问题**（reuters.com / ft.com / theguardian.com 稳定 502，github.com 重试后能通），55 条是站点反爬（403/405）。这两类都跟解析逻辑无关，换 UA 也救不了——对照实验见正文 4.13。
+
+这张表在「4.7 上游给过全文，只是被我们自己截掉了」之前是另一副样子。36氪原本全标 `empty`，
+看起来像抓不到——实际上它的订阅源一次就给整篇正文，是我们用 `summary_max_chars=600`
+在入口处截掉的。**先分清「本来就不该抓」和「真失败」，失败率这个指标才有意义。**
+
+判重结果 0 条转载、0 个簇。第一轮跑出 2 条「转载」，查下来是假阳性：两篇无关的 arXiv 论文，
+abs 页的模板文字（分类路径、编号、Submitted on、View PDF、Abstract:）占了正文一半以上，
+稀释指纹后距离被压到 10 位——正好卡在阈值边界。加了**跨域约束**之后清零：转载必须是
+「同一篇稿子被不同站点转走」，同域相似只能说明共用站点模板。
+
+363 条有指纹的文档里，跨域且正文高度相似的组合一个都没有，所以**真实语料里仍然没有「转载正例」**，
+这条能力目前只有构造数据的单测支撑。
+
 ## 环境排障：WSL 里 docker 报 `Exec format error`
 
 现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
@@ -181,9 +281,17 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
 
 ## 已知边界（后续阶段处理）
 
-- 主题分类目前是确定性关键词规则，存在少量误判（如"标准版"命中政策类）；阶段 5 引入模型分类与人工校正。
-- 关键词检索为 `ILIKE`；全文检索 / 向量检索在阶段 5 用 `tsvector` + pgvector 补上。
-- Hacker News 的外链故事正文不在 HN 上，摘要覆盖率仅 11%（18/201 条有正文），需阶段 3 抓取原文后补全。
+- 主题分类目前是确定性关键词规则，存在少量误判（如"标准版"命中政策类）；后续阶段引入模型分类与人工校正。
+- 关键词检索为 `ILIKE`；全文检索 / 向量检索在知识库阶段用 `tsvector` + pgvector 补上。
+- **中文媒体这条线只有 600 字摘要可检索**：36氪的 RSS 其实给了全文（3414~14173 字），但
+  `rights_note` 规定「全文不入库」，所以全文只用于算 SimHash 指纹、不进 `content_text`；
+  InfoQ `405`、OpenAI `403`（Cloudflare，换 UA 实测无效）。要做中文全文检索，只有三条路：
+  上无头浏览器、换有正文授权的中文源、或重新评估 36氪全文的授权边界。在此之前，中文召回
+  质量会明显低于英文——这是输入问题，不是模型问题。
+- Hacker News 本身不提供摘要（外链故事的正文在别人站上）。阶段 3 的 `make enrich` 会按热度抓外站正文，抓到后按「页面描述 > 正文首段」补 `summary`，覆盖率从 11% 提到 64%。剩下的 36% 卡在两处：**本机代理对部分域名稳定 502**（reuters / ft / guardian / youtube），以及站点反爬 403/405。前者是运行环境问题，把代理切到全局模式后重抓可以救回一部分；后者无解。
+- 抓取失败后**不自动重试**：实测失败原因绝大多数是 403/405 反爬，重试只会重复打同一请求。需要重抓时用 SQL 把 `content_status` 改回 `pending`（`content_error like 'ProxyError%'` 这类可以先试试，代理恢复后能救回）。
+- 采集不会自动补摘要：`make sync` 只拿元数据。对 HN 这类上游只给标题的源，要在同一轮里跑 `sync --enrich N`，否则每轮同步都会新攒一批 `pending`。
+- 真实语料里还没有「转载正例」：判重阈值（汉明 10 / Jaccard 0.35）的支撑目前来自构造数据的单测。363 条真实指纹里跨域相似组合为 0，第一轮跑出的 2 条「转载」是 arXiv 模板文字造成的假阳性，已由跨域约束修掉。接入更多中文媒体源之后需要重新校准。
 - GitHub Release Notes 里的 `**` 强调标记刻意不清洗：去标记的正则会把 `**kwargs`、`__init__`、`use_cache` 这类标识符改坏，而它们正是版本说明的主要信息载体。排版层渲染前需自行处理。
 - arXiv 的分页与窗口已在真实接口上验证（翻 6 页取 300 条约 46 秒、未触发 429），但限流是概率性的：真被限流时整轮抛 `RateLimitedError` 降级，不会写入半截批次。
 - arXiv 自带的分类（`cs.AI` / `cs.LG`）未写入 `topics`：它与项目的主题词表是两套体系，混用会让前端按主题筛选时出现只有论文才有的 slug。要按 arXiv 分类筛选需要单独加字段。

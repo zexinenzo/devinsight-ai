@@ -41,6 +41,16 @@ export type DocumentListItem = {
   fetched_at: string;
   rights_mode: string;
   quality_flags: string[];
+  /** 归一后的源内热度分（log1p）。null 表示该源不暴露互动数据 */
+  engagement_score: number | null;
+  engagement_raw: Record<string, number>;
+  content_status: string;
+  content_error: string | null;
+  /** 非空表示这条是转载，值指向原始条目的 id */
+  dup_of: string | null;
+  cluster_id: string | null;
+  /** 同一事件有几家在报；1 表示只有这一条 */
+  cluster_size: number;
   source: SourceBrief;
 };
 
@@ -130,6 +140,8 @@ export type DocumentQuery = {
   content_type?: string;
   limit?: number;
   cursor?: string;
+  /** time 按发布时间 / engagement 按热度 */
+  sort?: string;
 };
 
 export async function listDocuments(query: DocumentQuery) {

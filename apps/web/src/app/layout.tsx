@@ -47,7 +47,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               ))}
             </nav>
             <span className="ml-auto hidden text-xs text-zinc-400 sm:block">
-              阶段 2 · 多源接入与增量同步
+              阶段 3 · 正文补全与去重聚类
             </span>
           </div>
         </header>

@@ -23,6 +23,7 @@ from app.core.errors import UpstreamError
 from app.core.logging import get_logger
 from app.services.classifier import classify_topics
 from app.utils.dates import is_implausible, parse_any, parse_struct_time
+from app.utils.simhash import simhash
 from app.utils.text import clean_html, content_hash, truncate
 from app.utils.urls import canonicalize_url
 
@@ -30,6 +31,15 @@ logger = get_logger(__name__)
 
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 4
+
+# feed 自带文本超过这个长度，就认为它给的是整篇正文而不是摘要。
+# 实测分布：36氪 3414~14173 字，InfoQ 425~581，OpenAI 155~165。1200 这条线
+# 两边都有余量，不会把摘要型 feed 误判成全文型。
+FEED_FULLTEXT_MIN_CHARS = 1200
+
+# 与 content_service.FULL_TEXT_RIGHTS 同一口径。这里重复一份，是为了让
+# Connector 不反向依赖 service 层——Connector 应当能脱离数据库单独测试。
+FULL_TEXT_RIGHTS = ("full_text", "public_domain")
 
 
 class RetryableUpstreamStatus(Exception):
@@ -92,15 +102,35 @@ class RSSConnector(BaseConnector):
             return None
 
         canonical_url = canonicalize_url(raw_link)
-        summary = clean_html(
-            entry.get("summary") or entry.get("description"), max_chars=settings.summary_max_chars
-        )
-        content_text = None
+
+        # 先把原文完整清洗出来，再决定怎么分配长度。这一步不能顺手带 max_chars：
+        # 36氪 的 RSS 一次就给整篇正文（实测 3414~14173 字），按 600 字截掉等于
+        # 扔掉 82% 的内容，而且库外补不回来——那些文章页是前端渲染的 SPA，
+        # 服务端 HTML 里连 meta 描述都没有。
+        feed_text = clean_html(entry.get("summary") or entry.get("description")) or ""
+
+        # content:encoded 是 RSS 的标准扩展字段，通常比 summary 更完整
         if entry.get("content"):
             try:
-                content_text = clean_html(entry["content"][0].get("value"), max_chars=4000)
+                encoded = clean_html(entry["content"][0].get("value")) or ""
+                if len(encoded) > len(feed_text):
+                    feed_text = encoded
             except (IndexError, AttributeError, TypeError):
-                content_text = None
+                pass
+
+        summary = truncate(feed_text, settings.summary_max_chars) if feed_text else None
+
+        # feed 自带长文本时：只留指纹，不留正文。
+        # rights_note 写的是「全文不入库」，但没禁止用它做判断——64 位哈希不是
+        # 原文的复制品，算出来只用于判重，全文本身不写进数据库。
+        fingerprint = None
+        content_status = None
+        content_text = None
+        if len(feed_text) >= FEED_FULLTEXT_MIN_CHARS:
+            fingerprint = simhash(feed_text)
+            content_status = "from_feed"
+        if feed_text and self.spec.rights_mode in FULL_TEXT_RIGHTS:
+            content_text = truncate(feed_text, 4000)
 
         published_at = (
             parse_struct_time(entry.get("published_parsed"))
@@ -127,7 +157,9 @@ class RSSConnector(BaseConnector):
             canonical_url=canonical_url,
             title=title,
             summary=summary,
-            content_text=truncate(content_text, 4000),
+            content_text=content_text,
+            fingerprint=fingerprint,
+            content_status=content_status,
             language=language,
             region=self.spec.region,
             content_type="article",

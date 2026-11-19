@@ -48,7 +48,7 @@ from app.core.config import settings
 from app.core.errors import RateLimitedError, UpstreamError
 from app.core.logging import get_logger
 from app.services.classifier import classify_topics
-from app.utils.text import content_hash, truncate
+from app.utils.text import content_hash
 from app.utils.urls import canonicalize_url
 
 logger = get_logger(__name__)
@@ -332,6 +332,13 @@ class GitHubReleaseConnector(BaseConnector):
 
         summary = markdown_to_text(release.get("body"), max_chars=settings.summary_max_chars)
 
+        # 以前这里是 content_text=truncate(summary, 4000)，但 summary 早在上一行
+        # 就被 summary_max_chars 截到 600 字了，再截一次 4000 得到的是同一段文字。
+        # 结果就是 60 条 release 的 content_text 全部等于 summary（均值 533 字），
+        # 「有正文」这个统计因此一直虚高。
+        # rights_note 写的是「存 Notes 摘要，正文链接回 GitHub」，所以正文留空，
+        # 用 content_status 标明这类条目的上游信息已经够用、不需要抓网页。
+
         published_at = None
         for key in ("published_at", "created_at"):
             raw = release.get(key)
@@ -353,6 +360,20 @@ class GitHubReleaseConnector(BaseConnector):
         if release.get("draft"):
             quality_flags.append("draft")
 
+        # 热度：二进制附件下载量之和。这是 Release 接口唯一直接暴露的
+        # 「多少人真的装了这个版本」的信号——reactions 要额外发一次请求，
+        # 而 star 是仓库级指标，用它衡量单个版本会让所有版本看起来一样热。
+        assets = release.get("assets")
+        downloads = 0
+        if isinstance(assets, list):
+            for asset in assets:
+                if isinstance(asset, dict) and isinstance(asset.get("download_count"), int):
+                    downloads += asset["download_count"]
+        engagement: dict[str, Any] = {}
+        if isinstance(assets, list):
+            engagement["downloads"] = downloads
+            engagement["primary"] = downloads
+
         return CanonicalDocument(
             source_key=self.spec.source_key,
             external_id=str(release_id),
@@ -360,7 +381,8 @@ class GitHubReleaseConnector(BaseConnector):
             canonical_url=canonicalize_url(html_url),
             title=title,
             summary=summary,
-            content_text=truncate(summary, 4000) if summary else None,
+            content_text=None,
+            content_status="from_feed",
             language=self.spec.language or "en",
             region=self.spec.region,
             content_type="release",
@@ -370,6 +392,7 @@ class GitHubReleaseConnector(BaseConnector):
             topics=classify_topics(title, summary),
             rights_mode=self.spec.rights_mode,
             quality_flags=quality_flags,
+            engagement=engagement,
         )
 
     # --- 入口 ---

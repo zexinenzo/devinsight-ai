@@ -8,7 +8,7 @@ PY := $(ROOT)/.venv/bin/python
 API := $(ROOT)/apps/api
 WEB := $(ROOT)/apps/web
 
-.PHONY: help check-docker up down logs wait-db migrate seed sync status docs api worker beat web test lint fmt
+.PHONY: help check-docker up down logs wait-db migrate seed sync sync-enrich status docs engagement refingerprint enrich dedup api worker beat web test lint fmt
 
 help: ## 显示可用命令
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -47,11 +47,26 @@ seed: ## 写入内置来源注册表（幂等）
 sync: ## 立刻采集所有启用来源
 	cd $(API) && $(PY) -m app.cli sync --all
 
+sync-enrich: ## 采集并顺手补一轮摘要（N=40 指定条数；不补的话 HN 新条目全是「缺摘要」）
+	cd $(API) && $(PY) -m app.cli sync --all --enrich $(or $(N),40)
+
 status: ## 查看来源健康与最近批次
 	cd $(API) && $(PY) -m app.cli list
 
 docs: ## 查看最新入库情报
 	cd $(API) && $(PY) -m app.cli docs --limit 15
+
+engagement: ## 回填 HN 热度（阶段 3 新增列的存量补数，热度决定抓谁）
+	cd $(API) && $(PY) -m app.cli engagement
+
+enrich: ## 按热度补全正文与指纹（每源各占名额，不是全局排序）
+	cd $(API) && $(PY) -m app.cli enrich
+
+refingerprint: ## 重拉上游修正存量条目（ALL=1 时覆盖 API 源，会消耗额度）
+	cd $(API) && $(PY) -m app.cli refingerprint $(if $(ALL),--all-sources,)
+
+dedup: ## 标记转载（SimHash）并聚合同事件报道（标题相似度）
+	cd $(API) && $(PY) -m app.cli dedup
 
 api: ## 启动 FastAPI（热重载，:8000）
 	cd $(API) && $(PY) -m uvicorn app.main:app --reload --port 8000

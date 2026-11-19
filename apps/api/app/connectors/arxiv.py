@@ -52,7 +52,7 @@ from app.core.errors import RateLimitedError, UpstreamError
 from app.core.logging import get_logger
 from app.services.classifier import classify_topics
 from app.utils.dates import is_implausible, parse_any, parse_struct_time
-from app.utils.text import clean_html, content_hash, truncate
+from app.utils.text import clean_html, content_hash
 from app.utils.urls import canonicalize_url
 
 logger = get_logger(__name__)
@@ -67,6 +67,9 @@ MAX_PAGES = 6
 MIN_REQUEST_GAP_SECONDS = 3.0
 
 ABS_URL = "https://arxiv.org/abs/{arxiv_id}"
+# 摘要保留上限。arXiv 摘要极少超过 2000 字符，这个值够用又不会让 summary
+# 无界增长（列表页最多同时取 50 条，字段过大也会拖慢响应）。
+ARXIV_ABSTRACT_MAX_CHARS = 2000
 _VERSION_SUFFIX = re.compile(r"v\d+$")
 _OPENSEARCH_TOTAL = re.compile(r"<opensearch:totalResults[^>]*>(\d+)<")
 
@@ -243,7 +246,10 @@ class ArxivConnector(BaseConnector):
         if not arxiv_id or not title:
             return None
 
-        summary = clean_html(entry.get("summary"), max_chars=settings.summary_max_chars)
+        # 摘要按自己的上限保留，不套全局的 600 字：arXiv 的 abstract 常见
+        # 1000~1800 字符，按 600 截断会把结论砍掉，而摘要正是这篇论文唯一
+        # 可检索的语义入口（PDF 按 rights_note 不入库）。
+        summary = clean_html(entry.get("summary"), max_chars=ARXIV_ABSTRACT_MAX_CHARS)
         if summary:
             summary = " ".join(summary.split())
         # 摘要里的 LaTeX（如 $T\\to\\infty$）刻意保留：去标记会改变数学含义，
@@ -275,7 +281,12 @@ class ArxivConnector(BaseConnector):
             canonical_url=canonical_url,
             title=title,
             summary=summary,
-            content_text=truncate(summary, 4000),
+            # 摘要不是正文，不再复制一份进 content_text。以前这里是
+            # content_text=truncate(summary, 4000)，但 summary 已被截到 600 字，
+            # 复制过去等于把「有正文」的统计做成虚数。论文的正文是 PDF，按
+            # rights_note 不入库，所以这里留空是符合规则的状态。
+            content_text=None,
+            content_status="from_feed",
             language=self.spec.language or "en",
             region=self.spec.region,
             content_type="paper",

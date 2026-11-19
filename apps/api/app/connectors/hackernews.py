@@ -95,11 +95,18 @@ class HackerNewsConnector(BaseConnector):
         # Ask HN / Show HN 这类自帖没有外链，用讨论页本身做规范地址，
         # 否则这些条目会因为缺 url 被整批丢掉。
         raw_link = (item.get("url") or "").strip()
+        has_external_link = bool(raw_link)
         if not raw_link:
             raw_link = ITEM_PAGE_TEMPLATE.format(item_id=item_id)
 
         canonical_url = canonicalize_url(raw_link)
         summary = clean_html(item.get("text"), max_chars=settings.summary_max_chars)
+
+        # 自帖的 item.text 就是作者写的正文，直接当正文存（标 from_feed，不再抓网页）。
+        # 外链故事没有 text，正文只能去站外抓，这里必须留空走 pending——
+        # 早期版本把 summary 复制进 content_text，让「有正文」变成假象：
+        # 指纹算的是这段文本，判重时却拿它跟网页正文比，永远对不上。
+        body_text = truncate(summary, 4000) if summary and not has_external_link else None
 
         published_at = None
         if isinstance(item.get("time"), (int, float)):
@@ -115,6 +122,17 @@ class HackerNewsConnector(BaseConnector):
         if item.get("dead") or item.get("deleted"):
             quality_flags.append("upstream_flagged")
 
+        # 热度信号来自 item 详情本身，不需要额外请求：
+        # score 是投票数，descendants 是整棵评论树的条数。
+        # 注意这两个值在故事刚发布时都是 1 / 0，要等一阵才涨上来——
+        # 所以这里记的是「采集此刻」的值，后续要靠回访刷新，不能指望一次到位。
+        engagement: dict[str, Any] = {}
+        if isinstance(item.get("score"), int):
+            engagement["score"] = item["score"]
+            engagement["primary"] = item["score"]
+        if isinstance(item.get("descendants"), int):
+            engagement["comments"] = item["descendants"]
+
         return CanonicalDocument(
             source_key=self.spec.source_key,
             external_id=str(item_id),
@@ -122,7 +140,9 @@ class HackerNewsConnector(BaseConnector):
             canonical_url=canonical_url,
             title=title,
             summary=summary,
-            content_text=truncate(summary, 4000) if summary else None,
+            content_text=body_text,
+            # 自帖正文已在手，不必再抓网页；外链故事留给 enrich 按热度补
+            content_status="from_feed" if body_text else None,
             language="en",
             region=self.spec.region,
             content_type="article",
@@ -132,6 +152,7 @@ class HackerNewsConnector(BaseConnector):
             topics=classify_topics(title, summary),
             rights_mode=self.spec.rights_mode,
             quality_flags=quality_flags,
+            engagement=engagement,
         )
 
     # --- 入口 ---

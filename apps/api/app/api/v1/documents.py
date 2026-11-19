@@ -16,7 +16,7 @@ from app.services import document_service
 router = APIRouter(tags=["documents"])
 
 
-def to_list_item(document: Document, source: Source) -> DocumentListItem:
+def to_list_item(document: Document, source: Source, cluster_size: int = 1) -> DocumentListItem:
     return DocumentListItem(
         id=document.id,
         title=document.title,
@@ -31,6 +31,13 @@ def to_list_item(document: Document, source: Source) -> DocumentListItem:
         fetched_at=document.fetched_at,
         rights_mode=document.rights_mode,
         quality_flags=list(document.quality_flags or []),
+        engagement_score=document.engagement_score,
+        engagement_raw=dict(document.engagement_raw or {}),
+        content_status=document.content_status,
+        content_error=document.content_error,
+        dup_of=document.dup_of,
+        cluster_id=document.cluster_id,
+        cluster_size=cluster_size,
         source=DocumentSourceBrief(
             id=source.id,
             source_key=source.source_key,
@@ -56,6 +63,8 @@ async def list_documents(
     published_to: datetime | None = Query(None, alias="to", description="发布时间上限（ISO 8601）"),
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = Query(None, description="上一页返回的 next_cursor"),
+    sort: str = Query("time", pattern="^(time|engagement)$", description="time 按时间 / engagement 按热度"),
+    include_reposts: bool = Query(False, description="是否显示转载副本（默认隐藏）"),
 ):
     page = await document_service.list_documents(
         session,
@@ -69,18 +78,25 @@ async def list_documents(
         published_to=published_to,
         limit=limit,
         cursor=cursor,
+        sort=sort,
+        include_reposts=include_reposts,
     )
-    items = [to_list_item(document, src).model_dump(mode="json") for document, src in page.items]
+    items = [
+        to_list_item(document, src, page.cluster_sizes.get(document.cluster_id, 1)).model_dump(mode="json")
+        for document, src in page.items
+    ]
     return envelope(request, items, total=page.total, next_cursor=page.next_cursor)
 
 
 @router.get("/documents/{document_id}", summary="文档详情")
 async def get_document(document_id: uuid.UUID, request: Request, session: SessionDep):
     document, source = await document_service.get_document(session, document_id)
-    item = to_list_item(document, source)
+    cluster_size = await document_service.count_cluster_members(session, document.cluster_id)
+    item = to_list_item(document, source, cluster_size)
     detail = DocumentDetail(
         **item.model_dump(),
         content_text=document.content_text,
         content_hash=document.content_hash,
+        simhash=document.simhash,
     )
     return envelope(request, detail.model_dump(mode="json"))

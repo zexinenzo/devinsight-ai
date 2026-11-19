@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -162,6 +163,25 @@ class Document(Base):
     )
     quality_score: Mapped[float | None] = mapped_column(Numeric(5, 4))
     is_indexed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # --- 阶段 3：热度 / 正文 / 去重 ---
+    # 归一后的热度分（源内可比），原始指标留 JSONB 保留可追溯性
+    engagement_score: Mapped[float | None] = mapped_column(Float)
+    engagement_raw: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    # pending 未抓 / fetched 已抓 / empty 源站无正文 / failed 抓取失败 / skipped 不合规跳过
+    content_status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    content_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 失败原因：403 与 Timeout 都是 failed，但只有后者值得下一轮重试
+    content_error: Mapped[str | None] = mapped_column(Text)
+    # SimHash 是 64 位无符号，PG BIGINT 有符号，存十六进制字符串避免符号位来回翻转
+    simhash: Mapped[str | None] = mapped_column(Text)
+    # 判为转载时指向被转载的原始条目；cluster_id 是同事件聚簇标识（取簇内最早一条的 id）
+    dup_of: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL")
+    )
+    cluster_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
