@@ -694,6 +694,9 @@ curl "localhost:8000/api/v1/evidence?q=大模型&include_web=false"
   转载同一篇通稿会被算成两个声源。
 - **没做 pooling。** 评测指标用于比较同一系统的不同版本，不能当绝对水平引用。
 
+完整推导见教程第 6 章：provider 契约怎么定（6.2）、为什么两边分数不能混排（6.6）、
+域名分级与事实核查的边界（6.7）、错误码为什么必须分 503 与 502（6.8）。
+
 ## 环境排障：WSL 里 docker 报 `Exec format error`
 
 现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
@@ -776,7 +779,7 @@ cat /proc/sys/fs/binfmt_misc/WSLInterop   # 应显示 enabled
 - GitHub Release Notes 里的 `**` 强调标记刻意不清洗：去标记的正则会把 `**kwargs`、`__init__`、`use_cache` 这类标识符改坏，而它们正是版本说明的主要信息载体。排版层渲染前需自行处理。
 - arXiv 的分页与窗口已在真实接口上验证（翻 6 页取 300 条约 46 秒、未触发 429），但限流是概率性的：真被限流时整轮抛 `RateLimitedError` 降级，不会写入半截批次。
 - arXiv 自带的分类（`cs.AI` / `cs.LG`）未写入 `topics`：它与项目的主题词表是两套体系，混用会让前端按主题筛选时出现只有论文才有的 slug。要按 arXiv 分类筛选需要单独加字段。
-- 关键词分类器对论文标题几乎没有区分度：实测 50 篇 arXiv 论文全部判为 `ai-models`。这是阶段 5 换模型分类的直接动因。
+- 关键词分类器对论文标题几乎没有区分度：实测 50 篇 arXiv 论文全部判为 `ai-models`。这是后续阶段换模型分类的直接动因。
 - DeepMind、TechCrunch 已注册但默认停用，尚未做健康检查。
 - GitHub 分页上限 3 页（60 条）。两轮之间新增超过 60 个版本时仍会出现空档，实际不会发生；真发生只能靠人工补。
 - 未做 user/鉴权（单用户本地版），`/admin` 端点暂无权限校验。
