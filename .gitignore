@@ -34,3 +34,14 @@ docs/tools/formatted-technical-manual.html
 # 评测结果（一条命令可重跑，不入库）；题库本身必须入库，否则评测失去意义
 apps/api/data/eval_*.json
 !apps/api/data/eval_questions.json
+# 例外：补池判定结果。这不是"跑一遍就有"的结果，而是 1767 条逐条判定，
+# 重跑要几个小时，且判定本身无法由代码复现。它一旦丢了，README 里
+# "R@5 从 0.820 掉到 0.678" 这句话就再也算不出来。
+!apps/api/data/eval_pool_labelled.json
+# 补池工作表的中间产物：由 eval_pool.json 一条命令重新导出，不入库
+apps/api/data/pool_batches/
+apps/api/data/eval_pool_review.csv
+apps/api/data/pool_review_sample.csv
+apps/api/data/entity_coverage.json
+# 例外：人工抽检过的那一版（89 行带判定），是"模型初判可信度"的原始证据
+!apps/api/data/pool_review_sample_judged.csv

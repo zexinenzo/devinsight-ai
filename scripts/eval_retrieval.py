@@ -49,10 +49,9 @@ from pathlib import Path
 API_DIR = Path(__file__).resolve().parents[1] / "apps" / "api"
 sys.path.insert(0, str(API_DIR))
 
-from sqlalchemy import text  # noqa: E402
-
-from app.db.session import session_scope  # noqa: E402
-from app.services import document_service  # noqa: E402
+from app.db.session import session_scope
+from app.services import document_service
+from sqlalchemy import text
 
 QUESTIONS_PATH = API_DIR / "data" / "eval_questions.json"
 MODES = ("keyword", "vector", "hybrid")
@@ -94,6 +93,28 @@ async def resolve_ground_truth(session, questions: list[dict]) -> dict[str, set]
             unresolved.append(f'{question["id"]}: {question["expect"]}')
         truth[question["id"]] = hits
     return truth, unresolved
+
+
+def load_qrels_overlay(path: Path) -> dict[str, set]:
+    """读补池补出来的相关项，按题号聚成 doc_id 集合。
+
+    两种形状都接受：补池脚本的原生输出（`{"new_relevant": [{qid, doc_id}]}`）
+    和手写的 `{qid: [doc_id]}`。直接吃原生输出，少一道手抄——
+    每抄一次 36 位 uuid 就多一次静默写错的机会，而写错的后果是
+    「这条永远不可能被召回」，指标偏低却看不出原因。
+
+    为什么做成「叠加层」而不是直接改 eval_questions.json：
+    人工写的 expect 和模型初判的补池项验证强度不同，混在一个文件里就分不开了。
+    分开存，报告才能同时给出「补池前 / 补池后」两个数，抽检推翻某几条时也能单独回滚。
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "new_relevant" in payload:
+        overlay: dict[str, set] = defaultdict(set)
+        for item in payload["new_relevant"]:
+            overlay[item["qid"]].add(item["doc_id"])
+        return dict(overlay)
+    return {qid: set(ids) for qid, ids in payload.items()}
 
 
 def recall_at(ranked: list, truth: set, k: int) -> float:
@@ -167,8 +188,7 @@ def report(all_results: dict[str, list[dict]], verbose: bool) -> None:
     header = f'{"模式":<9}{"类型":<8}{"题数":>5}{"R@5":>8}{"R@10":>8}{"MRR":>8}{"nDCG@5":>9}'
     print(header)
     print("-" * len(header))
-    for mode in all_results:
-        rows = all_results[mode]
+    for mode, rows in all_results.items():
         by_type = defaultdict(list)
         for row in rows:
             by_type[row["type"]].append(row)
@@ -229,6 +249,27 @@ async def main(args) -> int:
             print("先修正 eval_questions.json 里的标题片段，再跑评测。")
             return 1
 
+        if args.qrels:
+            overlay = load_qrels_overlay(Path(args.qrels))
+            added = 0
+            touched = 0
+            for question_id, ids in overlay.items():
+                if question_id not in truth:
+                    print(f"  警告：补池里的 {question_id} 不在评测集中，已跳过")
+                    continue
+                fresh = ids - truth[question_id]
+                if fresh:
+                    touched += 1
+                truth[question_id] |= fresh
+                added += len(fresh)
+            # 把「分母变了」这件事明说出来。补池只会增加相关项、不会减少，
+            # 所以任何指标下降都不是系统变差了，而是尺子变严了——
+            # 这句话必须跟数字一起出现，否则下一个人会以为检索退化了。
+            print(
+                f"补池相关项：{touched} 题新增 {added} 条"
+                f"（共 {sum(len(v) for v in truth.values())} 条相关项）\n"
+            )
+
         all_results = {}
         for mode in modes:
             all_results[mode] = await run_mode(
@@ -276,4 +317,8 @@ if __name__ == "__main__":
         help="强制要求重排，模型缺失时直接报错而不是静默跳过",
     )
     parser.add_argument("--save", help="把结果存成 JSON，便于跨版本对比")
+    parser.add_argument(
+        "--qrels",
+        help="补池补出来的相关项（pool_judge merge 的输出），叠加到 ground truth 上重算",
+    )
     sys.exit(asyncio.run(main(parser.parse_args())))
