@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -102,7 +102,7 @@ def _cursor_time(cursor: dict[str, Any] | None) -> datetime | None:
 
 
 def _iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _window_clause(cursor_dt: datetime | None) -> str | None:
@@ -119,7 +119,7 @@ def _window_clause(cursor_dt: datetime | None) -> str | None:
 
     if cursor_dt is None:
         return None
-    floor = (cursor_dt - timedelta(minutes=1)).astimezone(timezone.utc)
+    floor = (cursor_dt - timedelta(minutes=1)).astimezone(UTC)
     return f"submittedDate:[{floor:%Y%m%d%H%M} TO 999912312359]"
 
 
@@ -388,7 +388,7 @@ class ArxivConnector(BaseConnector):
             )
 
         latency_ms = int((time.perf_counter() - started) * 1000)
-        fetched_at = datetime.now(timezone.utc)
+        fetched_at = datetime.now(UTC)
 
         documents = [doc for doc in (self._build_document(e, fetched_at) for e in collected) if doc]
 
@@ -397,7 +397,7 @@ class ArxivConnector(BaseConnector):
             documents = [d for d in documents if d.published_at is None or d.published_at >= cursor_dt]
 
         def sort_key(doc: CanonicalDocument) -> datetime:
-            return doc.published_at or datetime.min.replace(tzinfo=timezone.utc)
+            return doc.published_at or datetime.min.replace(tzinfo=UTC)
 
         # 升序取前 max_items（留下的是较旧的未处理条目），再按最新在前输出
         documents.sort(key=sort_key)

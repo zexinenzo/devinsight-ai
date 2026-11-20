@@ -36,7 +36,7 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -51,12 +51,12 @@ _API_DIR = Path(__file__).resolve().parents[1] / "apps" / "api"
 if str(_API_DIR) not in sys.path:
     sys.path.insert(0, str(_API_DIR))
 
-from app.services.classifier import classify_topics  # noqa: E402
-from app.utils.simhash import simhash  # noqa: E402
-from app.utils.text import content_hash  # noqa: E402
-from app.utils.urls import canonicalize_url  # noqa: E402
+from app.services.classifier import classify_topics
+from app.utils.simhash import simhash
+from app.utils.text import content_hash
+from app.utils.urls import canonicalize_url
 
-DB = dict(host="localhost", port=5432, user="devinsight", password="change_me_dev", dbname="devinsight")
+DB = {"host": "localhost", "port": 5432, "user": "devinsight", "password": "change_me_dev", "dbname": "devinsight"}
 UA = {"User-Agent": "DevInsightAI/0.1 (+contact: admin@example.com)"}
 DELAY = 0.4  # 秒/请求
 SOURCE_KEY = "ruanyifeng_zh"
@@ -129,13 +129,13 @@ def extract_article(html_text: str, url: str) -> dict | None:
     match = DATE_RE.search(page_text)
     if match:
         year, month, day = (int(x) for x in match.groups())
-        published = datetime(year, month, day, tzinfo=timezone.utc)
+        published = datetime(year, month, day, tzinfo=UTC)
     if published is None:
         # 兜底：URL 里就带着 /blog/2026/11/，退化成当月 1 号。
         # 同月内几期的先后会乱，但排序和去重只看量级，不影响结论。
         url_match = re.search(r"/blog/(\d{4})/(\d{2})/", url)
         if url_match:
-            published = datetime(int(url_match.group(1)), int(url_match.group(2)), 1, tzinfo=timezone.utc)
+            published = datetime(int(url_match.group(1)), int(url_match.group(2)), 1, tzinfo=UTC)
 
     return {"title": title, "body": body, "published_at": published, "url": url}
 
@@ -349,8 +349,8 @@ async def backfill() -> int:
                         "zh",
                         "cn",
                         "article",
-                        article["published_at"] or datetime.now(timezone.utc),
-                        datetime.now(timezone.utc),
+                        article["published_at"] or datetime.now(UTC),
+                        datetime.now(UTC),
                         content_hash(article["title"], canonical, summary),
                         simhash(article["body"]),
                         # topics / quality_flags 是 jsonb，裸 list 会被当成 text[]

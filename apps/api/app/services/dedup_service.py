@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 from sqlalchemy import select
@@ -93,7 +93,7 @@ def _domain(document: Document) -> str:
     """规范域名，用于判断两条是否来自同一个站点。"""
 
     host = urlparse(document.canonical_url or document.original_url or "").netloc.lower()
-    return host[4:] if host.startswith("www.") else host
+    return host.removeprefix("www.")
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -114,7 +114,7 @@ async def mark_reposts(
     后续比较，避免出现 A→B→C 的链——链会让「原始来源」这个概念失效。
     """
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
+    cutoff = datetime.now(UTC) - timedelta(days=within_days)
     statement = (
         select(Document)
         .where(
@@ -229,7 +229,7 @@ async def cluster_events(
     摘要、时间线的时候再做。
     """
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
+    cutoff = datetime.now(UTC) - timedelta(days=within_days)
     statement = (
         select(Document)
         .where(

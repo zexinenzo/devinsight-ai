@@ -10,7 +10,6 @@ import time
 
 import httpx
 import pytest
-
 from app.connectors.base import SourceSpec
 from app.connectors.github_releases import (
     _PRERELEASE_TAG,

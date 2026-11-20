@@ -1,0 +1,32 @@
+# 项目级 ruff 配置。
+#
+# 此前仓库里没有任何 ruff 配置，规则集完全取决于本机装的 ruff 版本：
+# 0.17.5 的默认集已经包含 B / BLE / FURB / SIM / UP / I，而更早的版本
+# 只有 E4/E7/E9/F。也就是说同一份代码在两台机器上「干净」与否可以不同，
+# CI 更是无从复现。这里把规则集显式写死，本机与 CI 行为一致。
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E4",   # import 相关
+    "E7",   # 语法层面的问题
+    "E9",   # 运行时必然报错
+    "F",    # pyflakes
+    "I",    # 导入排序
+    "UP",   # pyupgrade：用 3.11+ 的写法
+    "B",    # bugbear：可变默认值、循环变量捕获这类真 bug
+    "SIM",  # 可以简化但当前写法不明显的分支
+    "BLE",  # 裸 except：要求显式豁免并写理由
+    "FURB", # 现代化改写
+]
+
+[lint.per-file-ignores]
+# FastAPI 的依赖注入写法：Query() / Depends() 必须出现在默认参数里，
+# 挪进函数体反而会破坏框架取参数的方式。这是该框架的既定风格。
+"apps/api/app/api/**/*.py" = ["B008"]
+# 这些是一次性 / 运维脚本，先 sys.path.insert 把 apps/api 放进路径，
+# 再 import app.*。导入不落在文件顶部是这套加载顺序的必然结果，
+# 不是随手写的。逐个 import 加 noqa 只会把真正的告警淹掉。
+"scripts/*.py" = ["E402"]

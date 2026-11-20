@@ -34,8 +34,7 @@ _CJK_CHAR = re.compile(r"^[\u4e00-\u9fff]$")
 
 # 英文高频虚词。它们在任何文章里都出现，参与加权只会把不同文章的指纹拉近。
 _STOP_WORDS = frozenset(
-    "a an the of to and or in on for with is are was were be been being it its this that these those "
-    "as at by from not but if then than so such can will would should could may might have has had do does did".split()
+    ["a", "an", "the", "of", "to", "and", "or", "in", "on", "for", "with", "is", "are", "was", "were", "be", "been", "being", "it", "its", "this", "that", "these", "those", "as", "at", "by", "from", "not", "but", "if", "then", "than", "so", "such", "can", "will", "would", "should", "could", "may", "might", "have", "has", "had", "do", "does", "did"]
 )
 
 # 少于该 token 数的"正文"多半是导航条、错误页或占位符，算出来的指纹没有判别力

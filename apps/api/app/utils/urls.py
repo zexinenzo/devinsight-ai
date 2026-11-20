@@ -81,4 +81,4 @@ def canonicalize_url(url: str) -> str:
 
 def domain_of(url: str) -> str:
     host = (urlsplit(url).hostname or "").lower()
-    return host[4:] if host.startswith("www.") else host
+    return host.removeprefix("www.")

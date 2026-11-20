@@ -5,10 +5,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from app.services.classifier import classify_topics
 from app.utils.dates import is_implausible, parse_any, parse_struct_time
 from app.utils.text import clean_html, content_hash
@@ -42,20 +41,20 @@ class TestDates:
     def test_parse_struct_time(self):
         struct = (2026, 11, 17, 8, 0, 0, 1, 321, 0)
         parsed = parse_struct_time(struct)
-        assert parsed == datetime(2026, 11, 17, 8, 0, tzinfo=timezone.utc)
+        assert parsed == datetime(2026, 11, 17, 8, 0, tzinfo=UTC)
 
     def test_parse_rfc822(self):
-        assert parse_any("Tue, 17 Nov 2026 08:00:00 GMT") == datetime(2026, 11, 17, 8, 0, tzinfo=timezone.utc)
+        assert parse_any("Tue, 17 Nov 2026 08:00:00 GMT") == datetime(2026, 11, 17, 8, 0, tzinfo=UTC)
 
     def test_parse_iso_with_z(self):
-        assert parse_any("2026-11-17T08:00:00Z") == datetime(2026, 11, 17, 8, 0, tzinfo=timezone.utc)
+        assert parse_any("2026-11-17T08:00:00Z") == datetime(2026, 11, 17, 8, 0, tzinfo=UTC)
 
     def test_parse_garbage_returns_none(self):
         assert parse_any("昨天下午") is None
         assert parse_any(None) is None
 
     def test_implausible_future(self):
-        fetched = datetime(2026, 11, 17, tzinfo=timezone.utc)
+        fetched = datetime(2026, 11, 17, tzinfo=UTC)
         assert is_implausible(fetched + timedelta(days=2), fetched) is True
         assert is_implausible(fetched - timedelta(days=1), fetched) is False
 

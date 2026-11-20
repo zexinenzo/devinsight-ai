@@ -15,7 +15,7 @@ import argparse
 import asyncio
 import sys
 import unicodedata
-from datetime import timezone
+from datetime import UTC
 
 from sqlalchemy import text
 
@@ -65,7 +65,7 @@ async def _list() -> int:
     for source in sources:
         run = runs.get(source.id)
         last_success = (
-            source.last_success_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            source.last_success_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M")
             if source.last_success_at
             else "-"
         )

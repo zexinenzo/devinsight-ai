@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
 from app.connectors import arxiv as arxiv_module
 from app.connectors.arxiv import ArxivConnector, normalize_arxiv_id
 from app.connectors.base import SourceSpec

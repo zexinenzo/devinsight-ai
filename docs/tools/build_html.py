@@ -386,7 +386,6 @@ def render(blocks, toc, cover_title):
     out: list[str] = []
     section_no = 0
     h1_open = False
-    current_item = None  # 当前 h1 在 toc 里的条目
 
     def close_section_list():
         nonlocal h1_open
@@ -401,7 +400,6 @@ def render(blocks, toc, cover_title):
             anchor = f"section-{section_no}"
             title = payload
             toc.append((anchor, title))
-            current_item = anchor
             out.append(f'<h1 id="{anchor}">{inline(title)}</h1>')
             out.append('<div class="chapter-body">')
             h1_open = True

@@ -13,11 +13,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
-from sqlalchemy.dialects import postgresql
-
 from app.db.models import Document
 from app.services.document_service import _keyword_condition, _keyword_terms
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 
 
 def _compile(statement) -> str:

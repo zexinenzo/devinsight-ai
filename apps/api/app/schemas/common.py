@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Generic, TypeVar
 
 from fastapi import Request
@@ -49,7 +49,7 @@ def envelope(
 
     meta: dict[str, Any] = {
         "request_id": request_id_of(request),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "total": total,
         "next_cursor": next_cursor,
     }

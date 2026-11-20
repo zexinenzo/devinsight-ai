@@ -26,7 +26,10 @@ PostgreSQL 16 + pgvector ｜ Redis + Celery ｜（后续阶段）LangGraph + LLM
 
 ## 快速开始
 
-前置：Docker、Python 3.12+、Node.js 22+。依赖已装在仓库根 `.venv` 与 `apps/web/node_modules`。
+前置：Docker、Python 3.14、Node.js 22+。依赖已装在仓库根 `.venv` 与 `apps/web/node_modules`。
+Python 固定在 **3.14**，不是「3.12+」：`requirements.txt` 就是在这台 Linux venv 上 freeze 出来的，
+里面带 `uvloop` / `librt` 这类 Linux-only 包；`onnxruntime` / `tokenizers` 的 wheel 又按 CPython
+主次版本切分。换个版本不会立刻报错，而是等到某天向量检索 503 才发现。重建方式见下方「环境与 CI」。
 
 ```bash
 # 1. 起基础设施
@@ -58,6 +61,31 @@ make web           # http://localhost:3000/intelligence
 make worker        # Celery Worker
 make beat          # 见下方「自动跑的三件事」
 ```
+
+### 环境与 CI
+
+```bash
+make venv    # 重建 .venv：python3.14 + requirements.txt，一步到位
+make lint    # ruff check .（全仓，与 CI 同一条命令）
+make test    # 后端单元测试，220 个用例，不需要数据库
+```
+
+三条约束，都是踩过之后写下来的：
+
+**1. 只在 WSL 里跑这套 Python。** `.venv/bin/python3.14` 是 Linux 的 ELF 可执行文件，Windows 侧的
+python 执行不了它；反过来，用 Windows 的 python 去跑这份代码时，`asyncpg` / `uvloop` 这类包在
+Windows 上根本装不上，测试能过只是因为它们恰好被 mock 掉了。**跨系统跑同一份代码，"过了"不代表
+环境是对的。**
+
+**2. ruff 规则集写在仓库里，不依赖本机版本。** 之前没有 `ruff.toml`，规则集完全取决于装的 ruff 版本：
+0.17.5 的默认集带 `B` / `BLE` / `SIM` / `FURB` / `UP` / `I`，更早的版本只有 `E4/E7/E9/F`。
+同一份代码在两台机器上「干净」与否可以不同，CI 更是无从复现。现在 `ruff.toml` 显式 `select`
+规则集、`requirements.txt` pin 死 `ruff==0.17.5`、CI 启动时打印版本——三者任何一处漂了都能当场看见。
+
+**3. CI 只跑 lint + 单测，不跑检索评测。** `.github/workflows/ci.yml` 是两条命令，15 分钟超时。
+`scripts/eval_retrieval.py` 刻意没进去：它需要 pgvector + 1431 篇真实文档 + 736 MB 本地模型，
+单次 6 分钟起。把它塞进 CI 只会得到一个天天红、然后被所有人忽略的门禁。指标靠本地跑 +
+把结果写进 README，不靠 CI 兜。
 
 ### 配置 Agent（阶段 6）
 

@@ -10,10 +10,9 @@
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
 
 import pytest
-
 from app.services import embedding_service, vector_index_service
 from app.services.embedding_service import EmbeddingUnavailable, HashingEmbedder
 

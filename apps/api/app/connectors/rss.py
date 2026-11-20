@@ -12,11 +12,17 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import feedparser
 import httpx
-from tenacity import AsyncRetrying, RetryCallState, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.connectors.base import BaseConnector, CanonicalDocument, FetchOutcome
 from app.core.config import settings
@@ -267,7 +273,7 @@ class RSSConnector(BaseConnector):
                 code="upstream_http_error",
             )
 
-        fetched_at = datetime.now(timezone.utc)
+        fetched_at = datetime.now(UTC)
         parsed = await asyncio.to_thread(feedparser.parse, response.content)
         entries = parsed.get("entries") or []
 

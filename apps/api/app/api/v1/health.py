@@ -22,7 +22,8 @@ async def _check_db(session: SessionDep) -> tuple[bool, str | None, int]:
     try:
         await session.execute(text("select 1"))
         return True, None, int((time.perf_counter() - started) * 1000)
-    except Exception as exc:  # 健康检查要报告失败原因，而不是抛 500
+    # 健康检查要报告失败原因，而不是抛 500
+    except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"[:300], int((time.perf_counter() - started) * 1000)
 
 
@@ -32,7 +33,8 @@ async def _check_redis() -> tuple[bool, str | None, int]:
     try:
         await asyncio.wait_for(client.ping(), timeout=2)
         return True, None, int((time.perf_counter() - started) * 1000)
-    except Exception as exc:
+    # 同上：Redis 挂了要如实报 degraded，不能让 /health 自己 500
+    except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"[:300], int((time.perf_counter() - started) * 1000)
     finally:
         await client.aclose()

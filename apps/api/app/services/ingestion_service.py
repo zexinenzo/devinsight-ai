@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import insert
@@ -37,7 +37,7 @@ async def _record_success(
     http_status: int | None,
     latency_ms: int,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     source.last_success_at = now
     source.last_http_status = http_status
     source.consecutive_failures = 0
@@ -62,7 +62,7 @@ async def _record_failure(
     latency_ms: int,
     count_as_failure: bool = True,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     source.last_failure_at = now
     source.last_http_status = http_status
     if count_as_failure:
@@ -146,13 +146,14 @@ async def sync_source(
     try:
         connector = get_connector(spec)
         outcome = await connector.fetch()
-    except Exception as exc:  # 采集失败不应打断整批任务
+    # 采集失败不应打断整批任务：任何 Connector 异常都收敛成 run.status=failed
+    except Exception as exc:  # noqa: BLE001
         duration_ms = int((time.perf_counter() - started) * 1000)
         message = str(exc) or type(exc).__name__
         rate_limited = isinstance(exc, RateLimitedError)
         run.status = "failed"
         run.error = message[:1000]
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         run.duration_ms = duration_ms
         await _record_failure(
             session,
@@ -199,7 +200,7 @@ async def sync_source(
     run.updated_count = 0
     run.http_status = outcome.http_status
     run.duration_ms = duration_ms
-    run.finished_at = datetime.now(timezone.utc)
+    run.finished_at = datetime.now(UTC)
 
     await _record_success(session, source, http_status=outcome.http_status, latency_ms=outcome.latency_ms)
     await session.commit()

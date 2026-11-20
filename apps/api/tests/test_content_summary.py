@@ -17,6 +17,8 @@ from app.services.content_service import (
     _derive_summary,
     apply_result,
 )
+
+
 def _document(**overrides) -> Document:
     base = {
         "title": "标题",

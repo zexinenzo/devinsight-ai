@@ -84,7 +84,7 @@ def test_apply_result_records_attempt_and_time() -> None:
 def test_backoff_is_monotonic() -> None:
     """退避必须递增：恒定间隔等于把「域名级封锁」当成网络抖动反复重试。"""
 
-    assert RETRY_BACKOFF_HOURS == tuple(sorted(RETRY_BACKOFF_HOURS))
+    assert tuple(sorted(RETRY_BACKOFF_HOURS)) == RETRY_BACKOFF_HOURS
     assert len(RETRY_BACKOFF_HOURS) == MAX_FETCH_ATTEMPTS
 
 

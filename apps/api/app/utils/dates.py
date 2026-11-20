@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import calendar
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 _ONE_HOUR = timedelta(hours=1)
@@ -24,7 +24,7 @@ def parse_struct_time(struct: object) -> datetime | None:
         return None
     if timestamp <= 0:
         return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return datetime.fromtimestamp(timestamp, tz=UTC)
 
 
 def parse_any(value: str | None) -> datetime | None:
@@ -40,8 +40,8 @@ def parse_any(value: str | None) -> datetime | None:
     try:
         parsed = parsedate_to_datetime(text)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except (TypeError, ValueError, IndexError):
         pass
 
@@ -50,8 +50,8 @@ def parse_any(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(candidate)
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     except ValueError:
         return None
 

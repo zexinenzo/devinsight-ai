@@ -8,7 +8,7 @@ PY := $(ROOT)/.venv/bin/python
 API := $(ROOT)/apps/api
 WEB := $(ROOT)/apps/web
 
-.PHONY: help check-docker up down logs wait-db migrate seed sync sync-enrich status docs engagement refingerprint enrich dedup api worker beat web test lint fmt
+.PHONY: help check-docker up down logs wait-db migrate seed sync sync-enrich status docs engagement refingerprint enrich dedup api worker beat web test lint fmt venv
 
 help: ## 显示可用命令
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -83,8 +83,22 @@ web: ## 启动 Next.js（:3000）
 test: ## 运行后端单元测试
 	cd $(API) && $(PY) -m pytest
 
-lint: ## ruff 静态检查
-	cd $(API) && $(PY) -m ruff check .
+# 与 CI 完全一致：CI 在仓库根跑 ruff check .，这里就不能只查 apps/api，
+# 否则 scripts/ 与 docs/tools/ 的问题要等推送后才发现。
+lint: ## ruff 静态检查（全仓，与 CI 一致）
+	$(PY) -m ruff check .
 
-fmt: ## ruff 自动格式化
-	cd $(API) && $(PY) -m ruff format .
+fmt: ## ruff 自动格式化（全仓，与 CI 一致）
+	$(PY) -m ruff format .
+
+venv: ## 重建 .venv（python3.14 + requirements.txt；依赖清单即唯一事实来源）
+	@test -x /usr/bin/python3.14 || { \
+		echo "✗ 找不到 /usr/bin/python3.14"; \
+		echo "  这个项目固定用 3.14：requirements.txt 是在同一版本下 freeze 的，"; \
+		echo "  换版本会让 onnxruntime / tokenizers 的 wheel 对不上。"; \
+		exit 1; \
+	}
+	/usr/bin/python3.14 -m venv $(ROOT)/.venv
+	$(PY) -m pip install --upgrade pip
+	$(PY) -m pip install -r $(ROOT)/requirements.txt
+	@echo "✓ venv 就绪：$$($(PY) --version) / ruff $$($(PY) -m ruff --version | awk '{print $$2}')"

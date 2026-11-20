@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -63,19 +63,19 @@ MAX_PAGES = 3
 API_VERSION = "2022-11-28"
 
 # --- Markdown 清洗：Release Notes 是 Markdown，直接入库会有大量 ### 和 ** 噪音 ---
-_CODE_FENCE = re.compile(r"```.*?```", re.S)
+_CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE = re.compile(r"`([^`]*)`")
 _IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 _HTML_TAG = re.compile(r"<[^>]+>")
-_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
-_LIST_MARK = re.compile(r"^\s{0,3}[-*+]\s+", re.M)
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.MULTILINE)
+_LIST_MARK = re.compile(r"^\s{0,3}[-*+]\s+", re.MULTILINE)
 # 版本号里的预发布标记。GitHub 的 prerelease 布尔值并不可靠——vLLM 会发布
 # tag=v0.33.0rc3、name=v0.33.0、prerelease=false 的 release，
 # 只看布尔值会把候选版当正式版，而这正是"能力边界变化"最该被区分的地方。
 # 注意不能要求 rc 前面有分隔符：真实 tag 是 "v0.33.0rc3"（直接贴在数字后）。
 # 改为要求标记后面是结尾或分隔符，这样 "search-1.0" 里的 "rc" 不会被误命中。
-_PRERELEASE_TAG = re.compile(r"(?:rc|alpha|beta|pre|preview|dev)\d*(?=$|[-_.+])", re.I)
+_PRERELEASE_TAG = re.compile(r"(?:rc|alpha|beta|pre|preview|dev)\d*(?=$|[-_.+])", re.IGNORECASE)
 # 刻意不剥离 **强调** 和 __强调__ 标记。
 # 我们的来源全是 Python 项目（vLLM / transformers / ollama），Release Notes 里
 # **kwargs、__init__、use_cache 这类标识符极常见；用正则去强调标记会把
@@ -345,7 +345,7 @@ class GitHubReleaseConnector(BaseConnector):
             if not raw:
                 continue
             try:
-                published_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                published_at = datetime.fromisoformat(str(raw))
                 break
             except ValueError:
                 continue
@@ -415,7 +415,7 @@ class GitHubReleaseConnector(BaseConnector):
             logger.info("github_not_modified", extra={"source_id": self.spec.source_key})
             return FetchOutcome(documents=[], http_status=304, latency_ms=latency_ms, not_modified=True)
 
-        fetched_at = datetime.now(timezone.utc)
+        fetched_at = datetime.now(UTC)
         # 草稿不应进入情报流：它还没发布，随时会被改写或撤掉
         usable = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
         usable = [r for r in usable if isinstance(r.get("id"), int)]

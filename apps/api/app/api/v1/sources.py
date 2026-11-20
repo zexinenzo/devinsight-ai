@@ -10,7 +10,13 @@ from app.api.deps import SessionDep
 from app.core.logging import get_logger
 from app.db.session import session_scope
 from app.schemas.common import envelope
-from app.schemas.source import IngestionRunOut, SourceHealthLogOut, SourceHealthOut, SourceOut, SyncAccepted
+from app.schemas.source import (
+    IngestionRunOut,
+    SourceHealthLogOut,
+    SourceHealthOut,
+    SourceOut,
+    SyncAccepted,
+)
 from app.services import ingestion_service, source_service
 
 router = APIRouter()
@@ -88,7 +94,8 @@ async def trigger_sync(
             execution="queued",
             message="已提交 Celery 队列，稍后可在 /sources 健康页看到结果",
         )
-    except Exception as exc:  # broker 未启动时不能让接口直接 500
+    # broker 未启动时不能让接口直接 500，降级为进程内同步
+    except Exception as exc:  # noqa: BLE001
         logger.warning("celery_enqueue_failed", extra={"source_id": source.source_key})
         background.add_task(_inline_sync, source.id)
         accepted = SyncAccepted(

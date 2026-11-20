@@ -51,7 +51,7 @@ class SourceSpec:
         *,
         max_items: int = 200,
         cursor: dict[str, Any] | None = None,
-    ) -> "SourceSpec":
+    ) -> SourceSpec:
         """从 ORM Source 构造，避免 Connector 依赖数据库模型细节。"""
 
         return cls(

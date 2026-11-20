@@ -14,12 +14,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.db.models import Document
 from app.services.dedup_service import _domain, group_similar_titles
 
-BASE = datetime(2026, 11, 18, 10, 0, tzinfo=timezone.utc)
+BASE = datetime(2026, 11, 18, 10, 0, tzinfo=UTC)
 
 
 def _item(

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
 
 from app.services import document_service, rerank_service
 from app.services.document_service import _rerank_ordered, _rerank_passage

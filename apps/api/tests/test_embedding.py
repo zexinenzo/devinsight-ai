@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import pytest
-
 from app.services import embedding_service
 from app.services.embedding_service import (
     CHUNK_OVERLAP,
@@ -52,7 +51,8 @@ def test_adjacent_chunks_overlap():
 
     chunks = chunk_text("中文句子内容可能很长很长。" * 300)
 
-    for previous, current in zip(chunks, chunks[1:]):
+    # 相邻块两两比较，切片本身就有意错开一位，不能要求等长
+    for previous, current in zip(chunks, chunks[1:], strict=False):
         gap = previous.char_end - current.char_start
         # 允许因为断句对齐而偏离，但不允许完全无重叠、也不允许重叠过多
         assert 0 < gap <= CHUNK_OVERLAP + 40
@@ -132,8 +132,9 @@ def test_hashing_embedder_ranks_related_above_unrelated():
     )
     query = embedder.embed_query("乌兰察布 数据中心")
 
-    related = sum(a * b for a, b in zip(query, passages[0]))
-    unrelated = sum(a * b for a, b in zip(query, passages[1]))
+    # 两条向量必须同维，长度不一致直接报错好过静默算出个错的余弦
+    related = sum(a * b for a, b in zip(query, passages[0], strict=True))
+    unrelated = sum(a * b for a, b in zip(query, passages[1], strict=True))
     assert related > unrelated
 
 

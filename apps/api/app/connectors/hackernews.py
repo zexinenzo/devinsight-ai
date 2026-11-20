@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -110,7 +110,7 @@ class HackerNewsConnector(BaseConnector):
 
         published_at = None
         if isinstance(item.get("time"), (int, float)):
-            published_at = datetime.fromtimestamp(item["time"], tz=timezone.utc)
+            published_at = datetime.fromtimestamp(item["time"], tz=UTC)
 
         quality_flags: list[str] = []
         if published_at is None:
@@ -207,7 +207,7 @@ class HackerNewsConnector(BaseConnector):
                 await client.aclose()
 
         latency_ms = int((time.perf_counter() - started) * 1000)
-        fetched_at = datetime.now(timezone.utc)
+        fetched_at = datetime.now(UTC)
 
         documents: list[CanonicalDocument] = []
         seen: set[str] = set()

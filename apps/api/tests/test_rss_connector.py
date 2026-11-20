@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
 from app.connectors.base import SourceSpec
 from app.connectors.rss import RSSConnector
 from app.core.errors import UpstreamError

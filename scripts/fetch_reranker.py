@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "apps" / "api"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fetch_embedding_model import DEFAULT_MIRROR, download, human  # noqa: E402
+from fetch_embedding_model import DEFAULT_MIRROR, download, human
 
 DEFAULT_REPO = "Xenova/bge-reranker-base"
 FILES = (

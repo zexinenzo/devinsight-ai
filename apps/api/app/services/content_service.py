@@ -45,7 +45,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -338,7 +338,9 @@ async def refresh_engagement(
         await client.aclose()
 
     updated = unchanged = unavailable = 0
-    for document, engagement in zip(documents, results):
+    # 上游返回条数不足时宁可尾部保留原值，也不要整批失败：这正是下面
+    # 「拿不到不影响已有值」那一段的既定行为，所以显式 strict=False。
+    for document, engagement in zip(documents, results, strict=False):
         if not engagement:
             # 拿不到（超时、条目被删、接口改格式）不影响已有值，原样保留
             unavailable += 1
@@ -522,7 +524,7 @@ def apply_result(document: Document, result: PageResult) -> str:
     """把取页结果写到 ORM 对象上。只在主协程里调用。"""
 
     document.content_status = result.status
-    document.content_fetched_at = datetime.now(timezone.utc)
+    document.content_fetched_at = datetime.now(UTC)
     # 成功时清空原因：否则上一轮的 403 会一直挂在这条记录上，看起来像这次也失败了
     document.content_error = result.error or None
     if result.status == "failed":
@@ -538,16 +540,15 @@ def apply_result(document: Document, result: PageResult) -> str:
         # 这段判断必须放在补摘要之前：一旦摘要先被填上，content_text 与 summary
         # 的相等关系就变了，is_summary_copy 会漏判真正的伪造副本。
         is_summary_copy = document.content_text is not None and document.content_text == document.summary
-        if stored:
-            # 已有摘要（来自 feed / API）时保留它，正文片段只补空位。
-            # 摘要通常是编辑写的导语，质量高于正文前 600 字这种机械截断。
-            #
-            # 但「有值」不等于「有正文」：如果 content_text 只是 summary 的副本
-            # （Connector 早期把 summary 复制进 content_text 的写法），那它不是
-            # 正文，必须让真抓到的网页文本覆盖掉。否则会出现「指纹是网页算的、
-            # 正文却是 600 字摘要」这种自相矛盾的状态。
-            if not document.content_text or is_summary_copy:
-                document.content_text = stored
+        # 已有摘要（来自 feed / API）时保留它，正文片段只补空位。
+        # 摘要通常是编辑写的导语，质量高于正文前 600 字这种机械截断。
+        #
+        # 但「有值」不等于「有正文」：如果 content_text 只是 summary 的副本
+        # （Connector 早期把 summary 复制进 content_text 的写法），那它不是
+        # 正文，必须让真抓到的网页文本覆盖掉。否则会出现「指纹是网页算的、
+        # 正文却是 600 字摘要」这种自相矛盾的状态。
+        if stored and (not document.content_text or is_summary_copy):
+            document.content_text = stored
         # 摘要在抓取阶段补齐：Hacker News 的外链故事上游只有标题，feed 阶段
         # summary 永远是空，唯一来源就是这里。优先级是页面自带描述 > 正文首段，
         # 因为描述是编辑写的导语，而正文首段经常是署名或栏目套话。
@@ -766,7 +767,10 @@ async def run_enrich(
         await client.aclose()
 
     before_with_summary = sum(1 for document in candidates if (document.summary or "").strip())
-    counters = Counter(apply_result(document, result) for document, result in zip(candidates, results))
+    counters = Counter(
+        apply_result(document, result)
+        for document, result in zip(candidates, results, strict=False)
+    )
     after_with_summary = sum(1 for document in candidates if (document.summary or "").strip())
     await session.commit()
 
@@ -778,7 +782,7 @@ async def run_enrich(
     index_error: str | None = None
     long_texts = [
         (document.id, result.text or "")
-        for document, result in zip(candidates, results)
+        for document, result in zip(candidates, results, strict=False)
         if result.status == "fetched" and len(result.text or "") > embedding_service.CHUNK_CHARS
     ]
     if long_texts:
@@ -840,7 +844,8 @@ async def backfill_fingerprints(session: AsyncSession, *, include_api: bool = Fa
         counters["sources"] += 1
         try:
             outcome = await get_connector(SourceSpec.from_source(source)).fetch()
-        except Exception as exc:  # 单个源失败不影响其他源
+        # 单个源失败不影响其他源
+        except Exception as exc:  # noqa: BLE001
             counters["source_failed"] += 1
             logger.warning(
                 "backfill_fetch_failed",
