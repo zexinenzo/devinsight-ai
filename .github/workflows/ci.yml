@@ -1,0 +1,52 @@
+name: CI
+
+# 这里只放"能在干净容器里跑完"的检查：lint + 单元测试。
+# 检索质量评测（scripts/eval_retrieval.py）刻意没放进来：它需要 pgvector +
+# 1431 篇真实文档 + 736 MB 本地模型（embedding 470 MB + 精排 266 MB），
+# 每次跑 6 分钟起。放进来只会变成"天天红、然后被忽略"的那种 CI。
+# 指标变化靠本地跑 + 把结果写进 README，不靠 CI 兜。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 必须与 .venv 一致：WSL 里的 venv 是 python3.14（pyvenv.cfg 写着 3.14.4），
+          # requirements.txt 里带 uvloop / librt 这类 Linux-only 包，也印证它是在
+          # 那台 Linux venv 上 freeze 出来的。CI 换 3.13 就等于在另一个环境下验收——
+          # onnxruntime / tokenizers 的 wheel 是按 cp 版本分的，这种漂移只有出事才发现。
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 显式 --version：项目级 ruff.toml 与 requirements.txt 都 pin 了这个版本，
+      # 三者不一致时先在这里看见，而不是等到某天规则集变了才莫名其妙红。
+      - name: ruff 版本
+        run: ruff --version
+
+      - name: 静态检查
+        run: ruff check .
+
+      # 测试自带 mock，不依赖 PostgreSQL / Redis（220 个用例在裸环境全过）。
+      - name: 单元测试
+        working-directory: apps/api
+        run: python -m pytest
