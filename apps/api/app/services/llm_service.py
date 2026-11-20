@@ -76,6 +76,7 @@ class ChatClient(Protocol):
         *,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
+        max_tokens: int | None = None,
     ) -> ChatResult: ...
 
 
@@ -185,6 +186,7 @@ class OpenAICompatibleClient:
         *,
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.2,
+        max_tokens: int | None = None,
     ) -> ChatResult:
         """发一次**非流式**请求。
 
@@ -193,13 +195,18 @@ class OpenAICompatibleClient:
         排查成本远大于收益。而用户真正想看的「过程」是阶段事件——开始检索、
         调了哪个工具、拿到几条证据——这些我们自己发，不依赖 token 流。
         最终答案一次性返回，SSE 里作为单个 answer 事件推出。
+
+        `max_tokens` 允许单次覆盖全局值：对话回答要短（全局 1200），
+        而批量抽取时输出的是 JSON 数组，一篇长文抽七八条事实就会撞到上限，
+        表现为 JSON 被从中间砍断——那不是格式问题，是配额问题。用同一个值
+        没法同时满足两边。
         """
 
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [message_payload(m) for m in messages],
             "temperature": temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens or self.max_tokens,
         }
         if tools:
             body["tools"] = tools

@@ -21,13 +21,14 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services import timeline_service
 from app.services.evidence_service import Evidence, collect_evidence
 from app.services.web_search_service import WebSearchUnavailable
 from app.utils.urls import canonicalize_url
@@ -396,6 +397,58 @@ SEARCH_WEB = ToolSpec(
 )
 
 
+ENTITY_TIMELINE = ToolSpec(
+    name="entity_timeline",
+    description=(
+        "查某个公司/产品的事实时间线：发布过什么、谁当过 CEO、收购过谁、什么时候裁过员。"
+        "按时间倒序返回，每条带日期、日期可信度和出处。"
+        "适合回答「这家公司这半年在产品线上做了什么变化」这类需要跨多篇文档汇总的问题——"
+        "语义检索只能给出一堆各自提到它的文章，给不出顺序。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "entity": {
+                "type": "string",
+                "description": "实体名，公司或产品，如 OpenAI、GPT-5、Anthropic。",
+            },
+            "start": {
+                "type": "string",
+                "description": "起点日期 YYYY-MM-DD，可省略。",
+            },
+            "end": {
+                "type": "string",
+                "description": "终点日期 YYYY-MM-DD，可省略。",
+            },
+        },
+        "required": ["entity"],
+    },
+    timeout_seconds=20.0,
+)
+
+FACTS_AS_OF = ToolSpec(
+    name="facts_as_of",
+    description=(
+        "查某个实体在**指定日期**的状态快照：那天哪些事实成立。"
+        "用于回答「2024 年 3 月这家公司的 CEO 是谁」这类需要还原历史状态的问题。"
+        "注意它和时间线的区别：时间线给区间，快照只给「那一天成立的那些」。"
+        "时间未知的事实无法判断当时是否成立，会单独列出，不要当成成立。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "实体名，如 OpenAI。"},
+            "date": {
+                "type": "string",
+                "description": "要还原的日期 YYYY-MM-DD。",
+            },
+        },
+        "required": ["entity", "date"],
+    },
+    timeout_seconds=20.0,
+)
+
+
 def make_search_local(pool: EvidencePool) -> ToolHandler:
     async def handler(
         session: AsyncSession, arguments: dict[str, Any]
@@ -529,14 +582,159 @@ def make_search_web(pool: EvidencePool) -> ToolHandler:
     return handler
 
 
+def _parse_date_arg(value: Any) -> date | None:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"日期格式应为 YYYY-MM-DD，收到 {value!r}") from exc
+
+
+def _entry_line(entry: timeline_service.TimelineEntry) -> str:
+    when = entry.valid_from.isoformat() if entry.valid_from else "日期未知"
+    if entry.valid_to:
+        when += f" → {entry.valid_to.isoformat()}"
+    reliability = timeline_service.DATE_SOURCE_LABELS.get(
+        entry.date_source, entry.date_source
+    )
+    return (
+        f"- {when}  {entry.predicate}：{entry.object_text}"
+        f"  〔{reliability}〕  出处：《{entry.document_title[:40]}》"
+    )
+
+
+def _render_timeline(heading: str, result: timeline_service.TimelineResult) -> str:
+    """渲染时间线。
+
+    「时间未知」必须单独一段并明确写出「不要假定它在任意时点成立」。
+    如果把它们混进正常条目里，模型会拿一条不知道哪年的事实去回答
+    「2024 年发生了什么」，而这正好是这张表要杜绝的错误。
+    """
+
+    lines = [
+        f"{heading}：{result.entity_name}（{result.entity_kind}）"
+        f"，有日期 {result.dated_count} 条，时间未知 {result.undated_count} 条"
+    ]
+    if result.entries:
+        lines.extend(_entry_line(entry) for entry in result.entries[:40])
+    if result.undated:
+        lines.append("")
+        lines.append("以下条目时间未知，不能据此回答「某个时点发生了什么」：")
+        lines.extend(_entry_line(entry) for entry in result.undated[:10])
+    if result.overlaps:
+        lines.append("")
+        lines.append("区间冲突（同一谓词下两件事同时成立，引用时要交代口径）：")
+        lines.extend(f"- {item}" for item in result.overlaps[:5])
+    return "\n".join(lines)
+
+
+def make_entity_timeline() -> ToolHandler:
+    async def handler(session: AsyncSession, arguments: dict[str, Any]) -> ToolOutcome:
+        entity = str(arguments.get("entity") or "").strip()
+        if not entity:
+            return ToolOutcome(ok=False, content="entity 不能为空，需要具体公司或产品名。")
+        try:
+            start = _parse_date_arg(arguments.get("start"))
+            end = _parse_date_arg(arguments.get("end"))
+        except ValueError as exc:
+            return ToolOutcome(ok=False, content=str(exc))
+
+        result = await timeline_service.entity_timeline(
+            session, entity, start=start, end=end
+        )
+        if result is None:
+            return ToolOutcome(
+                ok=False,
+                # 回显实体名 + 给出下一步，否则模型会原样重试同一个名字
+                content=(
+                    f"结构化库里没有「{entity}」这个实体。"
+                    "先用 search_local 确认它在文档里怎么写，再把那个写法传过来。"
+                ),
+            )
+        if not result.entries and not result.undated:
+            return ToolOutcome(
+                ok=False,
+                content=(
+                    f"实体「{result.entity_name}」存在但没有任何事实记录。"
+                    "说明这批文档还没被抽取，不是「它什么都没做」。"
+                ),
+            )
+        return ToolOutcome(
+            ok=True,
+            content=_render_timeline("事实时间线", result),
+            meta={
+                "entity": result.entity_name,
+                "dated": result.dated_count,
+                "undated": result.undated_count,
+                "conflicts": len(result.overlaps),
+            },
+        )
+
+    return handler
+
+
+def make_facts_as_of() -> ToolHandler:
+    async def handler(session: AsyncSession, arguments: dict[str, Any]) -> ToolOutcome:
+        entity = str(arguments.get("entity") or "").strip()
+        if not entity:
+            return ToolOutcome(ok=False, content="entity 不能为空，需要具体公司或产品名。")
+        try:
+            on = _parse_date_arg(arguments.get("date"))
+        except ValueError as exc:
+            return ToolOutcome(ok=False, content=str(exc))
+        if on is None:
+            return ToolOutcome(
+                ok=False, content="这个工具必须给 date（YYYY-MM-DD），否则就退化成时间线了。"
+            )
+
+        result = await timeline_service.as_of(session, entity, on)
+        if result is None:
+            return ToolOutcome(
+                ok=False,
+                content=f"结构化库里没有「{entity}」这个实体，先用 search_local 确认写法。",
+            )
+        head = f"{on.isoformat()} 的状态快照"
+        if not result.entries:
+            # 空快照是最容易被误读的结果：它不是「那天什么都没发生」，
+            # 而是「没有一条事实的时间区间覆盖那天」。区别必须说出来。
+            return ToolOutcome(
+                ok=True,
+                content=(
+                    f"{head}：{result.entity_name} 没有一条事实的生效区间覆盖这一天。"
+                    f"这不等于当天无事发生——另有 {result.undated_count} 条事实时间未知，"
+                    "无法判断它们当时是否成立。"
+                ),
+                meta={"entity": result.entity_name, "dated": 0, "undated": result.undated_count},
+            )
+        return ToolOutcome(
+            ok=True,
+            content=_render_timeline(head, result),
+            meta={
+                "entity": result.entity_name,
+                "dated": result.dated_count,
+                "undated": result.undated_count,
+            },
+        )
+
+    return handler
+
+
 def build_default_registry(pool: EvidencePool) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(SEARCH_LOCAL, make_search_local(pool))
     registry.register(SEARCH_WEB, make_search_web(pool))
+    # 阶段 7：结构化时间线。这两个工具查的是 fact_claims 表，不走向量检索，
+    # 所以不需要 EvidencePool —— 它们返回的是「已经结构化的事实 + 出处」，
+    # 不是待编号的候选证据。
+    registry.register(ENTITY_TIMELINE, make_entity_timeline())
+    registry.register(FACTS_AS_OF, make_facts_as_of())
     return registry
 
 
 __all__ = [
+    "ENTITY_TIMELINE",
+    "FACTS_AS_OF",
     "SEARCH_LOCAL",
     "SEARCH_WEB",
     "EvidenceItem",

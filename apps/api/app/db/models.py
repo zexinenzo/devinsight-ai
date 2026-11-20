@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -273,4 +275,111 @@ class DocumentChunk(Base):
     model: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Entity(Base):
+    """规范实体：公司、产品、人物、模型。
+
+    `canonical_key` 是比对用的键，不是展示用的名字。库里出现过的写法
+    （`OpenAI` / `openai` / `Open AI`）都要收敛到同一行，否则时间线会被切成三段：
+    每段都只有一部分事实，而人看到的「这家公司做过什么」永远不完整。
+
+    `kind` 参与唯一约束：`Apple` 作为公司是一个实体，作为水果是另一个。只按名字
+    去重会把它们并成一个，之后所有事实都混在一起。
+    """
+
+    __tablename__ = "entities"
+    __table_args__ = (
+        UniqueConstraint("kind", "canonical_key", name="uq_entities_kind_canonical"),
+        Index("ix_entities_canonical_key", "canonical_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_key: Mapped[str] = mapped_column(Text, nullable=False)
+    aliases: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class FactClaim(Base):
+    """一条事实声明，带两条时间轴。
+
+    **这是阶段 7 唯一不能简化的地方**：`valid_from`/`valid_to` 是事实在现实中成立的
+    区间，`recorded_at` 是系统写下这条记录的时间。两者绝不能压成一列——压成一列就
+    意味着「用新状态覆盖旧状态」，而覆盖之后，历史上那个状态和支撑它的证据一起消失。
+
+    写入纪律：**只 INSERT，不 UPDATE 值**。状态变化 = 插新行 + 把旧行的 `valid_to`
+    闭合。`valid_to IS NULL` 表示「至今仍成立」。
+
+    这条纪律由数据库触发器 `trg_fact_claims_no_rewrite` 强制（见迁移 0009）：
+    允许的 UPDATE 只有闭合 `valid_to` 和指向 `superseded_by`，改 `object_text` /
+    `predicate` / `valid_from` / `subject_id` / `document_id` 会直接抛异常。
+    ORM 层面看不出来，所以写在这里免得有人以为是普通可改字段。
+
+    `valid_from_source` 记录日期是怎么来的：`stated` 文中明说、`published` 用发文
+    时间兜底、`unknown` 无从得知。时间线上「11 月 18 日」看起来一样硬，但一个是
+    事实、一个是推测，这个区别必须留存。
+    """
+
+    __tablename__ = "fact_claims"
+    __table_args__ = (
+        # 重跑去重：同一文档对同一 (主语, 谓词, 宾语) 只有一条
+        UniqueConstraint(
+            "subject_id",
+            "predicate",
+            "object_text",
+            "document_id",
+            name="uq_fact_claims_identity",
+        ),
+        CheckConstraint(
+            "valid_to IS NULL OR valid_from IS NULL OR valid_to > valid_from",
+            name="ck_fact_claims_period",
+        ),
+        CheckConstraint(
+            "valid_from_source IN ('stated', 'published', 'unknown')",
+            name="ck_fact_claims_from_source",
+        ),
+        # 主查询是「某实体时间线按时间倒序」，联合索引让排序不必再走 sort
+        Index("ix_fact_claims_subject_valid", "subject_id", text("valid_from DESC")),
+        Index("ix_fact_claims_predicate", "predicate"),
+        Index("ix_fact_claims_document", "document_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    subject_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
+    )
+    predicate: Mapped[str] = mapped_column(Text, nullable=False)
+    object_text: Mapped[str] = mapped_column(Text, nullable=False)
+    object_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entities.id", ondelete="SET NULL")
+    )
+    # 现实时间。允许 NULL：报道可能完全不提时间，宁可留空也不拿采集时间冒充
+    valid_from: Mapped[date | None] = mapped_column(Date)
+    valid_to: Mapped[date | None] = mapped_column(Date)
+    valid_from_source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'unknown'")
+    )
+    # 系统时间：这条记录什么时候被写进来（事后复盘「当时我们知道什么」靠它）
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    evidence_text: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    # 指向取代它的那条。保留指针而不是删除旧行，才能解释「这条为什么失效了」
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fact_claims.id", ondelete="SET NULL")
     )

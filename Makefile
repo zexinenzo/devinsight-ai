@@ -8,7 +8,7 @@ PY := $(ROOT)/.venv/bin/python
 API := $(ROOT)/apps/api
 WEB := $(ROOT)/apps/web
 
-.PHONY: help check-docker up down logs wait-db migrate seed sync sync-enrich status docs engagement refingerprint enrich dedup api worker beat web test lint fmt venv
+.PHONY: help check-docker up down logs wait-db migrate seed sync sync-enrich status docs engagement refingerprint enrich dedup extract api worker beat web test lint fmt venv
 
 help: ## 显示可用命令
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -67,6 +67,11 @@ refingerprint: ## 重拉上游修正存量条目（ALL=1 时覆盖 API 源，会
 
 dedup: ## 标记转载（SimHash）并聚合同事件报道（标题相似度）
 	cd $(API) && $(PY) -m app.cli dedup
+
+# 默认只跑 5 篇 dry-run：抽一批看质量，比一次抽 500 篇再发现全被谓词校验打回便宜得多。
+# 需要写库时用 ARGS="--limit 50 --apply" 覆盖。
+extract: ## 抽取实体与事实（默认 5 篇 dry-run；ARGS="--limit 50 --apply" 写库）
+	cd $(ROOT) && $(PY) scripts/extract_facts.py $(if $(ARGS),$(ARGS),--limit 5 --dry-run)
 
 api: ## 启动 FastAPI（热重载，:8000）
 	cd $(API) && $(PY) -m uvicorn app.main:app --reload --port 8000

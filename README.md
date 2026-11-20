@@ -51,7 +51,7 @@ make enrich        # 按热度抓正文、算 SimHash、补摘要（默认 30 �
 make dedup         # 判转载 + 聚同事件（默认 30 天窗口）
 
 # 采集完顺手补一轮摘要（HN 这类上游只给标题的源必须这么做）
-cd apps/api && python -m app.cli sync --source hackernews_en --enrich 40
+cd apps/api && ../.venv/bin/python -m app.cli sync --source hackernews_en --enrich 40
 
 # 5. 启动服务（两个终端）
 make api           # http://localhost:8000/docs
@@ -70,19 +70,24 @@ make lint    # ruff check .（全仓，与 CI 同一条命令）
 make test    # 后端单元测试，220 个用例，不需要数据库
 ```
 
-三条约束，都是踩过之后写下来的：
+四条约束，都是踩过之后写下来的：
 
-**1. 只在 WSL 里跑这套 Python。** `.venv/bin/python3.14` 是 Linux 的 ELF 可执行文件，Windows 侧的
+**1. 这台机器没有 `python` 命令。** Ubuntu 26.04 只给 `python3`，`python` 是个空名（除非装
+`python-is-python3`）。所以本文所有命令一律写 `.venv/bin/python`（在仓库根）或
+`../.venv/bin/python`（在 `apps/api` 下），没有一条依赖 `python` 这个名字——照抄即可，不会
+撞上 `Command 'python' not found`。
+
+**2. 只在 WSL 里跑这套 Python。** `.venv/bin/python3.14` 是 Linux 的 ELF 可执行文件，Windows 侧的
 python 执行不了它；反过来，用 Windows 的 python 去跑这份代码时，`asyncpg` / `uvloop` 这类包在
 Windows 上根本装不上，测试能过只是因为它们恰好被 mock 掉了。**跨系统跑同一份代码，"过了"不代表
 环境是对的。**
 
-**2. ruff 规则集写在仓库里，不依赖本机版本。** 之前没有 `ruff.toml`，规则集完全取决于装的 ruff 版本：
+**3. ruff 规则集写在仓库里，不依赖本机版本。** 之前没有 `ruff.toml`，规则集完全取决于装的 ruff 版本：
 0.17.5 的默认集带 `B` / `BLE` / `SIM` / `FURB` / `UP` / `I`，更早的版本只有 `E4/E7/E9/F`。
 同一份代码在两台机器上「干净」与否可以不同，CI 更是无从复现。现在 `ruff.toml` 显式 `select`
 规则集、`requirements.txt` pin 死 `ruff==0.17.5`、CI 启动时打印版本——三者任何一处漂了都能当场看见。
 
-**3. CI 只跑 lint + 单测，不跑检索评测。** `.github/workflows/ci.yml` 是两条命令，15 分钟超时。
+**4. CI 只跑 lint + 单测，不跑检索评测。** `.github/workflows/ci.yml` 是两条命令，15 分钟超时。
 `scripts/eval_retrieval.py` 刻意没进去：它需要 pgvector + 1431 篇真实文档 + 736 MB 本地模型，
 单次 6 分钟起。把它塞进 CI 只会得到一个天天红、然后被所有人忽略的门禁。指标靠本地跑 +
 把结果写进 README，不靠 CI 兜。
@@ -306,9 +311,9 @@ arXiv 还要求 User-Agent 里能联系到人，否则限流阈值更严。`.env
 
 ```bash
 cd apps/api
-python ../scripts/backfill_ruanyifeng.py                                  # 全量回填（幂等，0.4s/请求）
-BF_START=2026-10 BF_END=2026-11 python ../scripts/backfill_ruanyifeng.py  # 试跑两个月
-python ../scripts/backfill_ruanyifeng.py --summaries-only                 # 改摘要规则后只重算，不重抓
+../.venv/bin/python ../scripts/backfill_ruanyifeng.py                                  # 全量回填（幂等，0.4s/请求）
+BF_START=2026-10 BF_END=2026-11 ../.venv/bin/python ../scripts/backfill_ruanyifeng.py  # 试跑两个月
+../.venv/bin/python ../scripts/backfill_ruanyifeng.py --summaries-only                 # 改摘要规则后只重算，不重抓
 ```
 
 回填踩的三个坑，都是「数据看着正常、其实全错」那一类：
@@ -515,13 +520,13 @@ CREATE INDEX ix_document_chunks_embedding
 
 ```bash
 # 1. 下载模型（470 MB，官方站点在部分网络下 502，脚本默认走国内镜像）
-python scripts/fetch_embedding_model.py
-python scripts/fetch_embedding_model.py --check   # 只检查不下载
+.venv/bin/python scripts/fetch_embedding_model.py
+.venv/bin/python scripts/fetch_embedding_model.py --check   # 只检查不下载
 
 # 2. 用已入库正文补索引（存量补课；新条目随 enrich 自动索引）
-cd apps/api && python -m app.cli embed --limit 500
-#    换模型后必须重算：python -m app.cli embed --reindex
-#    只补标题摘要块（每篇一条，61 秒）：python -m app.cli embed --headers-only
+cd apps/api && ../.venv/bin/python -m app.cli embed --limit 500
+#    换模型后必须重算：../.venv/bin/python -m app.cli embed --reindex
+#    只补标题摘要块（每篇一条，61 秒）：../.venv/bin/python -m app.cli embed --headers-only
 
 # 3. 检索
 curl "localhost:8000/api/v1/documents?q=乌兰察布的数据中心&mode=vector"
@@ -571,18 +576,18 @@ int8 量化会改变它的绝对量级，跨模型、跨语料都不可比。响
 `apps/api/data/eval_questions.json` 是 40 道题，四类各测一种能力：`fact`（单篇具体事实）、`topic`（多篇主题）、`named`（专有名词，这一档 keyword 本该赢）、`en`（英文，单独报告不与中文混算）。
 
 ```bash
-python scripts/eval_retrieval.py                              # 三种模式全跑
-python scripts/eval_retrieval.py --mode hybrid --no-doc-agg    # 关掉聚合路做 A/B
-python scripts/eval_retrieval.py --mode hybrid --no-rerank     # 关掉重排做 A/B
-python scripts/eval_retrieval.py --verbose                     # 看未命中明细
+.venv/bin/python scripts/eval_retrieval.py                              # 三种模式全跑
+.venv/bin/python scripts/eval_retrieval.py --mode hybrid --no-doc-agg    # 关掉聚合路做 A/B
+.venv/bin/python scripts/eval_retrieval.py --mode hybrid --no-rerank     # 关掉重排做 A/B
+.venv/bin/python scripts/eval_retrieval.py --verbose                     # 看未命中明细
 ```
 
 实时搜索的价值用另一套指标量（答案每天变，R@5 不适用）：
 
 ```bash
-python scripts/eval_evidence.py --local-profile   # 本地时效画像，不联网
-python scripts/eval_evidence.py --lang zh         # 只跑中文问题（消耗额度）
-python scripts/eval_evidence.py --replay          # 回放录制响应，不消耗额度
+.venv/bin/python scripts/eval_evidence.py --local-profile   # 本地时效画像，不联网
+.venv/bin/python scripts/eval_evidence.py --lang zh         # 只跑中文问题（消耗额度）
+.venv/bin/python scripts/eval_evidence.py --replay          # 回放录制响应，不消耗额度
 ```
 
 | 模式 | R@5 | R@10 | MRR | nDCG@5 |
@@ -606,10 +611,10 @@ python scripts/eval_evidence.py --replay          # 回放录制响应，不消�
 `MRR` 不变（0.879），`nDCG@5` 0.824 → 0.722。掉分不是系统变差，是尺子变严：补池只增加相关项，分母涨了而分子几乎不动。42 条新增里 38 条在 `topic`（抽检中 8 条模型判宽的分歧也全在 `topic`）——**人标主题题时只标"最像的那个答案"，这正是 `topic` 类长期偏高的机制**。补池修不了池外盲区（六路并集只覆盖全库 47%），这一项如实留在局限里。
 
 ```bash
-python scripts/pool_eval_candidates.py     # 六路取并集，约 8 分钟
-python scripts/pool_judge.py export        # 判定工作表（不含名次、按 md5 排序）
-python scripts/pool_judge.py merge --labels apps/api/data/pool_labels
-python scripts/eval_retrieval.py --mode hybrid --qrels apps/api/data/eval_pool_labelled.json
+.venv/bin/python scripts/pool_eval_candidates.py     # 六路取并集，约 8 分钟
+.venv/bin/python scripts/pool_judge.py export        # 判定工作表（不含名次、按 md5 排序）
+.venv/bin/python scripts/pool_judge.py merge --labels apps/api/data/pool_labels
+.venv/bin/python scripts/eval_retrieval.py --mode hybrid --qrels apps/api/data/eval_pool_labelled.json
 ```
 
 这套评测量出并修掉了三个真问题：
@@ -623,7 +628,7 @@ python scripts/eval_retrieval.py --mode hybrid --qrels apps/api/data/eval_pool_l
 召回用的是双塔模型：文档在入库时就被压成向量，之后再也看不到 query。384 个浮点数装不下"这句话到底在问什么"，实测里前 3 名相似度只差 0.008。精排换成 `bge-reranker-base` 的 int8 ONNX（266 MB），把 query 和候选拼成 `<s> query </s></s> passage </s>` 送进同一注意力窗口，直接输出相关性分数。
 
 ```bash
-python scripts/fetch_reranker.py    # 266 MB，走国内镜像
+.venv/bin/python scripts/fetch_reranker.py    # 266 MB，走国内镜像
 curl "localhost:8000/api/v1/documents?q=开源对一个国家意味着什么&mode=hybrid"
 # meta.reranked = true，每条的 match.rerank_score 是原始 logit
 ```
@@ -649,7 +654,7 @@ curl "localhost:8000/api/v1/documents?q=开源对一个国家意味着什么&mod
 ### 问题：本地库能答「库里有什么」，答不了「今天有什么」
 
 阶段 4 解决的是「正文里的字搜不到」，但另一条边界一直在：**库里只有采集过的源**。
-11 个启用源的时效画像（`python scripts/eval_evidence.py --local-profile`，不联网）：
+11 个启用源的时效画像（`.venv/bin/python scripts/eval_evidence.py --local-profile`，不联网）：
 
 ```
 source                     tier  docs  last7     newest
