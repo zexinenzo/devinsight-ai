@@ -172,29 +172,55 @@ def test_ceo_with_clean_evidence_stays() -> None:
     )
 
 
-def test_chinese_prefix_before_cfo_still_matches() -> None:
-    """真实库里那条 `英伟达 --ceo--> Colette Kress`，原文是「原CFO Colette Kress 接任临时CEO」。
+def test_past_title_before_cfo_is_not_a_contradiction() -> None:
+    """「原CFO 接任临时CEO」不是在冒充 CFO，是刚升任 CEO。
 
-    第一版用的是 `\\bCFO\\b`，而中文字符在 Python 正则里也算 `\\w`，
-    `原` 与 `C` 之间没有词边界，于是这条**唯一真实的 ③ 档错误被漏掉了**。
-    这个测试钉的就是那个 `\\b`。
+    这条曾经被我当成 ③ 档唯一命中真错的战绩，还专门写了测试「钉住 `\\b` 的坑」。
+    后来合并实体、回去读完整段落才发现：`原CFO` 里的 CFO 恰恰是「曾经是」，
+    规则读到的方向正好相反。**这条事实自始至终都是对的。**
+
+    教训不是正则写错了，是「关键词命中 ≠ 命题成立」——③ 档一旦写成关键词规则，
+    就退化成 ② 档里最差的那种：看起来有证据支撑，实际只匹配了词形。
     """
+    assert (
+        repair.classify(
+            "英伟达",
+            "ceo",
+            "Colette Kress",
+            "这是原CFO Colette Kress接任临时CEO以来,英伟达的首份成绩单。",
+        )
+        is None
+    )
+    assert (
+        repair.classify(
+            "NVIDIA",
+            "ceo",
+            "Jensen Huang",
+            "After former CEO Jensen Huang fought for US approval to sell H200 chips",
+        )
+        is None
+    )
+
+
+def test_present_tense_title_is_still_queued() -> None:
+    """剥掉过去式修饰语之后，「她是 CFO」这种直陈仍然要报——这才是 ③ 档的目标。"""
+
     verdict = repair.classify(
-        "英伟达",
+        "NVIDIA",
         "ceo",
         "Colette Kress",
-        "这是原CFO Colette Kress接任临时CEO以来,英伟达的首份成绩单。",
+        "Colette Kress, NVIDIA's chief financial officer, said on the call.",
     )
     assert verdict is not None
-    assert verdict[0] == "3_evidence"
+    assert verdict[1] == "evidence_mentions_other_c_level_title"
 
 
 def test_chairman_is_not_treated_as_contradiction() -> None:
     """`Fed Chairman Kevin Warsh` 不算错：Chairman 就是该机构的一把手。
 
-    第一版把 president / chairman / 董事长 都列成「别的头衔」，结果 ③ 档
-    唯一命中的竟是这条误报，而真正的 CFO 那条被漏掉——一次错的规则同时制造了
-    一个假阳性和一个假阴性。
+    第一版把 president / chairman / 董事长 都列成「别的头衔」，命中的是这条误报。
+    而它当时「漏掉」的 CFO 那条，事后证明本来就不该报——两个方向都错了一次，
+    只是错在不同层级：一个是词表不对，一个是整个判据方式不对。
     """
     assert (
         repair.classify(

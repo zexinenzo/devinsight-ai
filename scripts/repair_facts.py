@@ -107,15 +107,21 @@ FINANCING_EVENT_RE = re.compile(
 DEBT_FACILITY_RE = re.compile(r"(?:贷款|授信|承诺函|额度)", re.IGNORECASE)
 
 # ③ 证据里的反证词。命中不代表这条一定错，只代表「宾语和谓词对不上，去看一眼原文」。
+_C_TITLE = (
+    r"(?:CFO|CTO|COO|CMO|CPO)"
+    r"|chief\s+(?:financial|technology|operating|marketing|product)\s+officer"
+    r"|首席(?:财务|技术|运营|市场)官"
+)
 OTHER_TITLE_RE = re.compile(
     # 不用 \b：中文字符在 Python 正则里也算 \w，`原CFO Colette` 的 `\bCFO` 会匹配失败。
-    # 这个 bug 让真实的 CFO→CEO 错误从 ③ 档漏了过去，而误报了「Fed Chairman」那条——
-    # 后者恰恰不算错，Chairman 就是该机构的一把手。
-    r"(?<![A-Za-z])(?:CFO|CTO|COO|CMO|CPO)(?![A-Za-z])"
-    r"|chief\s+(?:financial|technology|operating|marketing|product)\s+officer"
-    r"|首席(?:财务|技术|运营|市场)官",
+    rf"(?<![A-Za-z])(?:{_C_TITLE})(?![A-Za-z])",
     re.IGNORECASE,
 )
+# 「原CFO」「前 CTO」「former CFO」里的头衔本身是过去式——它出现在证据里恰好说明
+# 此人现在**不是**那个职位，不能当反证。实跑教训：`这是原CFO Colette Kress接任临时CEO
+# 以来` 被判成「把 CFO 记成 CEO」，而原文说的是她刚接任 CEO，方向正好相反。
+# 这类假阳性比漏报更伤：它让整条 ③ 档规则失去可信度（0 命中，唯一输出是误报）。
+PAST_TITLE_RE = re.compile(rf"(?:原|前|前任|former|ex[-\s])\s*(?:{_C_TITLE})", re.IGNORECASE)
 ACQ_REVERSED_RE = re.compile(
     r"(?:acquired\s+by|was\s+acquired|is\s+acquired|被.{1,8}收购|收购方是)",
     re.IGNORECASE,
@@ -202,8 +208,9 @@ def evidence_reason(predicate: str, object_text: str, evidence: str | None) -> s
     if not evidence:
         return None
 
-    # 证据里出现了别的 C 级头衔，且宾语紧跟其后——典型是 CFO 被记成 CEO
-    if predicate == "ceo" and OTHER_TITLE_RE.search(evidence):
+    # 证据里出现了别的 C 级头衔——典型是 CFO 被记成 CEO。
+    # 先剥掉「原/前/former」修饰过的头衔：那些是过去式，不能当反证。
+    if predicate == "ceo" and OTHER_TITLE_RE.search(PAST_TITLE_RE.sub(" ", evidence)):
         return "evidence_mentions_other_c_level_title"
 
     # 收购方向写反：主语应当是被收购的那一方才对
