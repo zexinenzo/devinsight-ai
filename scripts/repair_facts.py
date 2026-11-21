@@ -6,6 +6,7 @@
     .venv/bin/python scripts/repair_facts.py retract --id <uuid> --undo   # 恢复采信
     .venv/bin/python scripts/repair_facts.py merge --id <uuid> --into <uuid>       # 合并实体
     .venv/bin/python scripts/repair_facts.py merge --id <uuid> --undo             # 解除合并
+    .venv/bin/python scripts/repair_facts.py supersede --list                    # 谁该被闭合
     .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新>        # 闭合区间
     .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新> --undo
 
@@ -56,6 +57,7 @@ import asyncio
 import csv
 import re
 import sys
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -70,6 +72,7 @@ from app.db.session import session_scope
 from app.services.timeline_service import (
     DATE_SOURCE_LABELS,
     MAX_MERGE_DEPTH,
+    MULTI_VALUED_PREDICATES,
     PREDICATES,
     build_entity_group,
 )
@@ -786,6 +789,104 @@ def parse_date_arg(value: str) -> date:
         raise ValueError(f"--on 应为 YYYY-MM-DD，收到 {value!r}") from exc
 
 
+def candidate_pairs(views: list[FactView]) -> list[tuple[FactView, FactView]]:
+    """把同一实体同一谓词下「都还开着」的几条，按时间排成前后任，只配相邻两条。
+
+    三个 CEO 依次是 A → B → C，需要闭合的是 (A,B) 和 (B,C) 两对，不是 (A,C)——
+    拿 A 去对 C 会得到「A 被 C 取代」，而 B 那段任期就凭空消失了。所以是 zip 相邻，
+    不是两两组合：`C(n,2)` 在三个宾语时就开始产假。
+    """
+
+    # 同一宾语留一条：同一件事被两篇报道写了两行（唯一约束含 subject_id，
+    # 合并前挡不住跨写法重复），那不是两个人同时在任
+    unique = {view.object_text: view for view in views}
+    ordered = sorted(
+        unique.values(), key=lambda view: (view.valid_from or date.max, view.object_text)
+    )
+    # strict=False 是故意的：左边永远比右边长一条，长度不等正是这里要的语义
+    return list(zip(ordered, ordered[1:], strict=False))
+
+
+def _pad(text: str, width: int) -> str:
+    """按终端显示宽度补空格。中文占两列，用 len() 算会把整张表撑歪。"""
+
+    used = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+    return text + " " * max(1, width - used)
+
+
+async def run_supersede_list(args) -> int:
+    """列出「同一实体、同一个单值谓词、两条以上同时开着」的候选，并直接给出命令。
+
+    为什么要有这一步：闭合需要两个 uuid，而人拿到 uuid 的唯一路径是粘一条长 SQL、
+    再从输出里抄两个 36 位字符串。抄反一次，被闭合的是**现任**的任期——它不会报错，
+    只会在某天让 `as_of` 答错一天。候选对由脚本算，`--id/--by` 就是脚本打印的那两行。
+    """
+
+    async with session_scope() as session:
+        entities = list((await session.execute(select(Entity))).scalars().all())
+        by_id = {row.id: row for row in entities}
+        facts = list(
+            (
+                await session.execute(
+                    select(FactClaim)
+                    .where(
+                        FactClaim.retracted_at.is_(None),
+                        FactClaim.valid_to.is_(None),
+                        FactClaim.predicate.notin_(MULTI_VALUED_PREDICATES),
+                    )
+                    .order_by(FactClaim.valid_from, FactClaim.recorded_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    # 按「合并组的根 + 谓词」聚合：合并只写指针，跨写法的同一件事仍挂在两个
+    # subject_id 上，按 id 分组会把英伟达/Nvidia 那一对拆成两组、各自看都不像冲突
+    groups: dict[tuple[uuid.UUID, str], list[FactView]] = {}
+    for fact in facts:
+        entity = by_id.get(fact.subject_id)
+        if entity is None:
+            continue
+        root = build_entity_group(entity, entities).root
+        groups.setdefault((root.id, fact.predicate), []).append(_view(fact))
+
+    candidates = 0
+    for (root_id, predicate), views in sorted(
+        groups.items(), key=lambda item: (item[0][1], by_id[item[0][0]].name)
+    ):
+        pairs = candidate_pairs(views)
+        if not pairs:
+            continue
+        print(f"\n{predicate}  ·  {by_id[root_id].name}")
+        ordered = sorted(
+            {view.object_text: view for view in views}.values(),
+            key=lambda view: (view.valid_from or date.max, view.object_text),
+        )
+        for view in ordered:
+            print(
+                f"  {_pad(view.object_text, 24)}"
+                f"{_pad(_span_text(view.valid_from, view.valid_to), 26)}{view.id}"
+            )
+        for old, new in pairs:
+            candidates += 1
+            plan = plan_closure(old, new, today=date.today())
+            if plan.error:
+                print(f"  ⚠ {old.object_text} → {new.object_text}：{plan.error}")
+                continue
+            print(f"  ✓ 可闭合在 {plan.cutoff.isoformat()}（{plan.reason}）")
+            print(
+                "      .venv/bin/python scripts/repair_facts.py supersede "
+                f"--id {old.id} --by {new.id} --dry-run"
+            )
+
+    if candidates == 0:
+        print("没有候选：单值谓词上没有同时开着两条的实体。")
+        return 0
+    print(f"\n共 {candidates} 对候选。上面每条 ✓ 的命令先加 --dry-run 跑一遍。")
+    return 0
+
+
 def _view(fact: FactClaim) -> FactView:
     return FactView(
         id=fact.id,
@@ -944,6 +1045,12 @@ async def main() -> int:
     supersede.add_argument("--reason", default="", help="为什么在这天结束（省略时由 --by 生成）")
     supersede.add_argument("--undo", action="store_true", help="重新打开区间（三列一起清回 NULL）")
     supersede.add_argument("--dry-run", action="store_true", help="只打印，不写库")
+    supersede.add_argument(
+        "--list",
+        dest="list_candidates",
+        action="store_true",
+        help="只读：列出该被闭合的候选对，并打印可复制的 supersede 命令",
+    )
 
     args = parser.parse_args()
     if args.command == "audit":
@@ -951,6 +1058,8 @@ async def main() -> int:
     if args.command == "merge":
         return await run_merge(args)
     if args.command == "supersede":
+        if args.list_candidates:
+            return await run_supersede_list(args)
         return await run_supersede(args)
     return await run_retract(args)
 

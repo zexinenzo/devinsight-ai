@@ -310,3 +310,62 @@ def test_closing_a_day_late_leaves_a_one_day_fake_conflict() -> None:
     problems = find_overlaps(entries)
     assert len(problems) == 1
     assert "2026-11-18" in problems[0]
+
+
+# --- supersede --list：候选对怎么配 -----------------------------------------
+
+
+def test_candidates_pair_only_neighbours_not_every_combination() -> None:
+    """三条依次在任，要闭合的是 (A,B) 与 (B,C)，不是 (A,C)。
+
+    拿 A 去对 C 会写出「A 被 C 取代」，中间 B 那段任期就凭空消失——而它不会报错，
+    时间线上只剩两行，看起来还挺整齐。
+    """
+    views = [
+        fact(object_text="A", start=date(2020, 1, 1)),
+        fact(object_text="B", start=date(2024, 1, 1)),
+        fact(object_text="C", start=date(2026, 1, 1)),
+    ]
+    pairs = repair.candidate_pairs(views)
+    assert [(old.object_text, new.object_text) for old, new in pairs] == [
+        ("A", "B"),
+        ("B", "C"),
+    ]
+
+
+def test_candidates_drop_duplicate_object_text() -> None:
+    """同一个宾语两行不是「两个人同时在任」，是同一件事被两篇报道写了两遍。
+
+    唯一约束含 `subject_id`，跨写法（`英伟达` / `Nvidia`）的重复在合并前挡不住，
+    所以这一步必须在配对之前去重，否则会配出「英伟达 → 英伟达」这种自我闭合。
+    """
+    views = [
+        fact(object_text="Jensen Huang", start=date(2026, 11, 18)),
+        fact(object_text="Jensen Huang", start=date(2026, 11, 19)),
+        fact(object_text="Colette Kress", start=date(2026, 11, 20)),
+    ]
+    pairs = repair.candidate_pairs(views)
+    assert len(pairs) == 1
+    assert pairs[0][1].object_text == "Colette Kress"
+
+
+def test_candidates_put_unknown_start_last() -> None:
+    """没有起始日的那条排最后：它不能被当作「新的开始成立」，cutoff 无从取。
+
+    排到最后，它会出现在 (已知, 未知) 这一对里，`plan_closure` 会要求 `--on`——
+    报错位置正好是这里，而不是在写库时才因为空区间被 CHECK 拒。
+    """
+    views = [
+        fact(object_text="unknown", start=None),
+        fact(object_text="known", start=date(2026, 1, 1)),
+    ]
+    pairs = repair.candidate_pairs(views)
+    assert pairs[0][0].object_text == "known"
+    plan = repair.plan_closure(pairs[0][0], pairs[0][1])
+    assert plan.error and "--on" in plan.error
+
+
+def test_pad_counts_cjk_as_two_columns() -> None:
+    """表格对齐靠显示宽度，不靠字符个数；否则中文名那一列整体右移。"""
+    assert repair._pad("英伟达", 8) == "英伟达  "
+    assert repair._pad("Nvidia", 8) == "Nvidia  "
