@@ -634,6 +634,9 @@ def _render_timeline(heading: str, result: timeline_service.TimelineResult) -> s
         lines.append("")
         lines.append("区间冲突（同一谓词下两件事同时成立，引用时要交代口径）：")
         lines.extend(f"- {item}" for item in result.overlaps[:5])
+        if len(result.overlaps) > 5:
+            # 截断而不报总数，等于让模型以为「就这 5 条」——和静默丢条目同一种病
+            lines.append(f"- 另有 {len(result.overlaps) - 5} 条同类冲突未列出")
     if result.retracted_count:
         # 只报数量、不给内容：撤回的前提是判定不可靠，把内容再摆出来等于
         # 让模型接着引用它。但数量必须说——「撤过」和「从没有过」是两件事。

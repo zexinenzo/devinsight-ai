@@ -49,6 +49,30 @@ PREDICATES: dict[str, str] = {
     "benchmark": "基准测试成绩",
 }
 
+# 多值谓词：同一时刻可以同时成立多个宾语，彼此不是替代关系。
+#
+# **名单之外的谓词一律按「单值」处理。** 这个默认方向是刻意的：漏报的表现是
+# 「时间线上两条矛盾并存却没人提示」，比多报危险得多，所以未知谓词宁可误报。
+#
+# 这个名单是合并 NVIDIA / 英伟达 之后才补的。合并前两组事实各自算冲突，
+# 合并后 `partnered_with` 的 6 条合作方进了同一次两两比较，一次产出 15 条
+# 「冲突」——台积电、富士康、安靠、矽品、景硕、三星电机当然可以同时都是伙伴。
+# 而这 18 条里真正的冲突只有 3 条，且渲染层只显示前 5 条，于是 15 条噪音
+# **把 3 条真信号全部挤出了视野**。多报的代价不是「多看几行」，是真信号被埋。
+MULTI_VALUED_PREDICATES: frozenset[str] = frozenset(
+    {
+        "released",  # 可以发布多个产品
+        "announced",  # 可以宣布多件事
+        "discontinued",  # 可以下线多个功能或产品线
+        "acquired",  # 可以收购多家公司
+        "partnered_with",  # 合作关系天然多值
+        "funded",  # 可以多轮融资
+        "layoff",  # 可以多次裁员
+        "open_sourced",  # 可以开源多个仓库
+        "benchmark",  # 多个基准成绩并存
+    }
+)
+
 KINDS = ("company", "product", "person", "model", "org")
 
 # 日期可信度的展示文案。这三档不是修饰，是「这个日期能不能当依据」的判定
@@ -385,6 +409,9 @@ def find_overlaps(entries: list[TimelineEntry]) -> list[str]:
     这不一定是谁错了——可能是报道口径不同（「代理 CEO」和「正式 CEO」），
     但它是**必须暴露的信号**：时间线上出现两条并列矛盾，
     比缺一条更危险，因为看起来都像真的。
+
+    只对**单值谓词**判定：`partnered_with` 有六个合作方不是冲突，一家公司
+    当然可以同时和台积电、富士康合作。名单见 `MULTI_VALUED_PREDICATES`。
     """
 
     problems: list[str] = []
@@ -394,6 +421,10 @@ def find_overlaps(entries: list[TimelineEntry]) -> list[str]:
 
     for predicate, group in by_predicate.items():
         if len(group) < 2:
+            continue
+        if predicate in MULTI_VALUED_PREDICATES:
+            # 多值谓词的空隙里也会藏着真问题（同一件事的中英文两条重复报道），
+            # 但那需要判「宾语是不是同义」——语义问题，规则判不了，留给人工队列。
             continue
         for i, left in enumerate(group):
             for right in group[i + 1 :]:
