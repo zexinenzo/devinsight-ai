@@ -911,6 +911,21 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 1 条宾语过长被拒），入库 148 条，重复 90 条，无事实 342 篇，抽取失败 13 篇
 （全为 max_tokens 截断），非明说日期 167 条，**证据 exact/partial/missing = 238/0/0**。
 
+### 合并：同一实体的多种写法
+
+`normalize_key` 不做跨语言对齐，`NVIDIA` 和 `英伟达` 必然是两行，两行各有各的事实。
+别名解决「用哪个名字能命中」，不解决「命中之后拿到谁的事实」——所以用指针合并：
+
+```bash
+.venv/bin/python scripts/repair_facts.py merge --id <被并的行> --into <根> --dry-run
+.venv/bin/python scripts/repair_facts.py merge --id <被并的行> --into <根>
+.venv/bin/python scripts/repair_facts.py merge --id <被并的行> --undo
+```
+
+**不改 `fact_claims.subject_id`**：触发器直接拒改，而且改完就再也查不到「这条事实当初
+挂在哪种写法下」。指针可逆，事实一行不动。查询侧 `subject_id IN (组)`，沿 `merged_into`
+向上找根、向下收写法，深度上限 8 防环；结果里会点名合并了哪几种写法。
+
 ### 修复：撤回，不删除
 
 ```bash
@@ -939,7 +954,9 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 - **12 个谓词只覆盖产品与技术事件**，没有财经入口。准备金率、加息、财报扭亏、变更交易单位
   这类中文快讯会被判成「无事实」，是漏不是空。
 - **对称谓词只挂一侧**：`A --partnered_with--> B` 记一条，查 B 时看不到 A。
-  `fact_claims.object_entity_id` 预留了位置但没填。
+  `fact_claims.object_entity_id` 预留了位置但没填——填之前必须先有实体合并
+  （已完成：`entities.merged_into`），否则宾语会解析到两个等价行中的任意一个，
+  「有些能双向」会变成「有些双向到 A 行、有些双向到 B 行」。
 - **`founded` / `open_sourced` 的宾语类型未约束**，已入库的错条目（`英伟达 --founded--> 黄仁勋`、
   `深微芯创 --funded--> 深产投`）还在库里，属人工队列——判定它们的疑点在语义不在形状，
   代码判不了。能机械判定的那 3 条（宾语是许可证）已撤回。
