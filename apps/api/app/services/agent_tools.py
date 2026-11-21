@@ -616,6 +616,14 @@ def _render_timeline(heading: str, result: timeline_service.TimelineResult) -> s
         f"{heading}：{result.entity_name}（{result.entity_kind}）"
         f"，有日期 {result.dated_count} 条，时间未知 {result.undated_count} 条"
     ]
+    if result.merged_names:
+        # 合并进来的写法必须点名。不说的话，「这家公司只有 3 条事实」和
+        # 「它其实有 9 条，另外 6 条挂在另一种写法下」在回复里长得一样，
+        # 而后者如果被当成「只有 3 条」，引用时就会漏掉一半。
+        lines.append(
+            f"（已合并 {len(result.merged_names)} 种同一实体的其他写法："
+            f"{'、'.join(result.merged_names[:5])}——下面的事实包含它们名下的记录）"
+        )
     if result.entries:
         lines.extend(_entry_line(entry) for entry in result.entries[:40])
     if result.undated:
@@ -694,6 +702,7 @@ def make_entity_timeline() -> ToolHandler:
                 "undated": result.undated_count,
                 "conflicts": len(result.overlaps),
                 "retracted": result.retracted_count,
+                "merged": result.merged_names,
             },
         )
 
@@ -752,6 +761,7 @@ def make_facts_as_of() -> ToolHandler:
                 "dated": result.dated_count,
                 "undated": result.undated_count,
                 "retracted": result.retracted_count,
+                "merged": result.merged_names,
             },
         )
 

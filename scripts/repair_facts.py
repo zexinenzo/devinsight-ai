@@ -1,9 +1,11 @@
-"""阶段 8：事实审计与撤回。
+"""阶段 8：事实审计、撤回与实体合并。
 
     .venv/bin/python scripts/repair_facts.py audit                       # 只读，人看的表格
     .venv/bin/python scripts/repair_facts.py audit --format csv --out .tmp/audit.csv
     .venv/bin/python scripts/repair_facts.py retract --id <uuid> --reason "…（附原文）"
     .venv/bin/python scripts/repair_facts.py retract --id <uuid> --undo   # 恢复采信
+    .venv/bin/python scripts/repair_facts.py merge --id <uuid> --into <uuid>       # 合并实体
+    .venv/bin/python scripts/repair_facts.py merge --id <uuid> --undo             # 解除合并
 
 **`audit` 为什么只读。** 判定与执行必须分开，否则就成了「让模型给自己判卷」——
 判定结果一旦能直接落库，就没有第二双眼睛看过它。中间那一步是人。
@@ -14,7 +16,11 @@
 撤回必须附理由（数据库有 CHECK），理由里最好带原文：没有依据的撤回本身
 就是一次不可审计的判断，和当初模型编造事实是同一种病。
 
-三档判定见设计稿第 5 节。核心事实是：270 条里能自动判定的只有 2 条，不到 1%。所以
+**`merge` 为什么写指针而不改 `subject_id`。** 触发器直接拒改 `subject_id`；而且改完
+就再也查不到「这条事实当初挂在哪种写法下」。指针可逆，事实一行不动，`--undo` 就还原。
+`entities.aliases` 那一列就是反例：它存在、也被读，但**没人往里写**，于是等于没有。
+
+三档判定见设计稿第 5 节。核心事实是：270 条里能自动判定的只有 3 条，刚过 1%。所以
 `audit` 的产出不是「一份待删清单」，而是**一份按可疑程度排好序的人工队列**——
 它的价值在于把 270 条缩到十几条，不在于替你决定。
 
@@ -51,7 +57,7 @@ sys.path.insert(0, str(API_DIR))
 
 from app.db.models import Entity, FactClaim
 from app.db.session import session_scope
-from app.services.timeline_service import DATE_SOURCE_LABELS, PREDICATES
+from app.services.timeline_service import DATE_SOURCE_LABELS, MAX_MERGE_DEPTH, PREDICATES
 from sqlalchemy import func, select
 
 # ① 形状：许可证标识符。没有任何谓词把许可证声明为合法宾语——
@@ -499,8 +505,128 @@ async def run_retract(args) -> int:
     return 0
 
 
+@dataclass(slots=True)
+class MergePlan:
+    """`merge` 的参数校验，同样在碰数据库之前做完，理由与 `RetractPlan` 一样。"""
+
+    dup: uuid.UUID | None
+    root: uuid.UUID | None
+    error: str = ""
+
+
+def parse_merge_args(args) -> MergePlan:
+    try:
+        dup = uuid.UUID(args.id)
+        root = uuid.UUID(args.into)
+    except ValueError as exc:
+        return MergePlan(dup=None, root=None, error=f"id 不是合法 UUID：{exc}")
+
+    if dup == root:
+        return MergePlan(dup=dup, root=root, error="不能把一个实体合并到它自己。")
+    return MergePlan(dup=dup, root=root)
+
+
+def cycle_error(dup: uuid.UUID, root: uuid.UUID, parent: dict[uuid.UUID, uuid.UUID]) -> str:
+    """`dup → root` 这条边加上之后会不会成环。
+
+    自指由数据库 CHECK 拦住，环路拦不住——CHECK 看不到别的行。而环路一旦写进库，
+    向上找根的查询就会靠深度上限硬停，那时已经没人知道哪一行是真的根了。
+    所以在写入前算一遍：从 root 沿链往上走，撞见 dup 就是成环。
+    """
+
+    seen = {root}
+    current = root
+    for _ in range(MAX_MERGE_DEPTH):
+        nxt = parent.get(current)
+        if nxt is None:
+            return ""
+        if nxt == dup:
+            return (
+                f"这条边会成环：{root} 已经（直接或间接）并到了 {dup} 名下。"
+                "先把那一头解开，或者把两边都指向真正的根。"
+            )
+        if nxt in seen:
+            return f"目标 {root} 所在的链本身已经有环，先修它再合并。"
+        seen.add(nxt)
+        current = nxt
+    return f"目标 {root} 的合并链超过 {MAX_MERGE_DEPTH} 层，不再往里加。"
+
+
+async def run_merge(args) -> int:
+    """把 `--id` 这一行并入 `--into` 那一行：写一个指针，事实一行不动。
+
+    **不 UPDATE `fact_claims.subject_id`**：触发器直接拒改；而且改完就再也查不到
+    「这条事实当初挂在哪种写法下」，合并变成不可逆。指针可逆——清空就还原。
+    """
+    plan = parse_merge_args(args)
+    if plan.error:
+        print(plan.error, file=sys.stderr)
+        return 2
+    assert plan.dup is not None and plan.root is not None
+
+    async with session_scope() as session:
+        dup = await session.get(Entity, plan.dup)
+        root = await session.get(Entity, plan.root)
+        if dup is None or root is None:
+            missing = plan.dup if dup is None else plan.root
+            print(f"⚠ 库里没有这个实体：{missing}", file=sys.stderr)
+            return 2
+
+        all_rows = list((await session.execute(select(Entity))).scalars().all())
+        parent = {e.id: e.merged_into for e in all_rows if e.merged_into is not None}
+
+        if args.undo:
+            if dup.merged_into is None:
+                print(f"{dup.name} 没有合并指针，跳过。", file=sys.stderr)
+                return 0
+            if not args.dry_run:
+                dup.merged_into = None
+            print(
+                f"{dup.name} → 独立实体" + ("（dry-run，未写库）" if args.dry_run else ""),
+                file=sys.stderr,
+            )
+            return 0
+
+        error = cycle_error(plan.dup, plan.root, parent)
+        if error:
+            print(error, file=sys.stderr)
+            return 2
+
+        counts = dict(
+            (
+                await session.execute(
+                    select(FactClaim.subject_id, func.count()).group_by(FactClaim.subject_id)
+                )
+            ).all()
+        )
+        print(f"并入：{dup.name}（{dup.kind}，{counts.get(dup.id, 0)} 条事实）")
+        print(f"  到：{root.name}（{root.kind}，{counts.get(root.id, 0)} 条事实）")
+        print(f"  合并后查询将覆盖 {counts.get(dup.id, 0) + counts.get(root.id, 0)} 条")
+
+        if dup.merged_into == plan.root:
+            print("已经指向这个根了，不用改。", file=sys.stderr)
+            return 0
+        if root.merged_into is not None:
+            # 链式是允许的（合并分批做），但要说出来：真正的根还在上面一层
+            print(
+                f"注：{root.name} 自己也并到了别的实体名下，这是一个中间节点。"
+                "查询会沿链找到真正的根，行为正确，但下次可以直接 --into 那个根。",
+                file=sys.stderr,
+            )
+
+        if not args.dry_run:
+            dup.merged_into = plan.root
+        print(
+            f"{dup.name} → {root.name}" + ("（dry-run，未写库）" if args.dry_run else ""),
+            file=sys.stderr,
+        )
+        return 0
+
+
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="事实审计与修复（audit 只读；retract 撤回不删除）")
+    parser = argparse.ArgumentParser(
+        description="事实审计与修复（audit 只读；retract 撤回不删除；merge 合并实体）"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     audit = sub.add_parser("audit", help="只读扫描，输出可疑事实队列")
@@ -520,9 +646,17 @@ async def main() -> int:
     retract.add_argument("--undo", action="store_true", help="恢复采信（把三列清回 NULL）")
     retract.add_argument("--dry-run", action="store_true", help="只打印，不写库")
 
+    merge = sub.add_parser("merge", help="把一个实体并入另一个（写指针，不改事实）")
+    merge.add_argument("--id", default="", help="被合并掉的那一行（别名写法）")
+    merge.add_argument("--into", default="", help="保留下来的根")
+    merge.add_argument("--undo", action="store_true", help="解除合并，让 --id 那行恢复独立")
+    merge.add_argument("--dry-run", action="store_true", help="只打印，不写库")
+
     args = parser.parse_args()
     if args.command == "audit":
         return await run_audit(args)
+    if args.command == "merge":
+        return await run_merge(args)
     return await run_retract(args)
 
 

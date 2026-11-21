@@ -300,6 +300,11 @@ class Entity(Base):
     __table_args__ = (
         UniqueConstraint("kind", "canonical_key", name="uq_entities_kind_canonical"),
         Index("ix_entities_canonical_key", "canonical_key"),
+        # 自指能拦，多跳环路不能——CHECK 看不到别的行，A→B→A 只能靠查询层的
+        # 深度上限兜（见 timeline_service.resolve_entity_group）。
+        CheckConstraint(
+            "merged_into IS NULL OR merged_into <> id", name="not_self_merged"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -310,6 +315,21 @@ class Entity(Base):
     canonical_key: Mapped[str] = mapped_column(Text, nullable=False)
     aliases: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    # 「这些行说的是同一个东西」的指针，指向合并后的规范行。
+    #
+    # 不是 `aliases` 的替代：别名解决「用哪个名字能命中」，它解决「命中之后拿到谁的
+    # 事实」。`NVIDIA` 与 `英伟达` 在 normalize_key 下必然分成两行，两行各有各的事实，
+    # 只有指针能把它们收进同一次查询。
+    #
+    # 指向的必须是**根**（`merged_into` 为 NULL 的那一行），但代码不假设这一点：
+    # 允许链式（A→B→C），查询时沿链找到根，深度上限 8。
+    # 可逆：置回 NULL 就还原，`fact_claims` 一行都不用动——这也是不 UPDATE
+    # `subject_id` 的理由（那条路还被触发器直接拒绝）。
+    merged_into: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="SET NULL"),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

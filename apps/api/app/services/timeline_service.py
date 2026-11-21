@@ -101,6 +101,10 @@ class TimelineResult:
     # undated / overlaps 里，但**数量必须露出来**：否则「我们撤了一条」和
     # 「这条从来没被记录过」在调用方看来完全一样，而前者恰恰需要交代。
     retracted_count: int = 0
+    # 这次查询实际覆盖了哪些写法。`NVIDIA` 和 `英伟达` 是两行实体，合并之后
+    # 一次查询拿到两行的事实——**必须把这件事说出来**，否则「这家公司只有 3 条
+    # 事实」和「它其实有 9 条，只是另外 6 条挂在另一种写法下」看起来一样。
+    merged_names: list[str] = field(default_factory=list)
 
     @property
     def dated_count(self) -> int:
@@ -141,20 +145,109 @@ async def resolve_entity(
     return None
 
 
-async def _count_retracted(session: AsyncSession, entity_id: uuid.UUID) -> int:
+async def _count_retracted(
+    session: AsyncSession, entity_ids: list[uuid.UUID]
+) -> int:
     """只数撤回条数，不取内容。
 
     查询层把撤回项全部过滤掉了，于是「我们撤了一条」和「从来没记过」在结果里
     长得一模一样。必须把数量说出来，否则 as_of 会安静地少掉一条本该交代的信息——
     而「安静地少一条」正是这个项目最忌讳的错误。
+
+    按整组 id 计数而不是按根 id：合并之后，撤回在子写法名下的一条记录同样是
+    「我们撤过」，只数根会把这句话漏掉。
     """
 
     total = await session.scalar(
         select(func.count())
         .select_from(FactClaim)
-        .where(FactClaim.subject_id == entity_id, FactClaim.retracted_at.is_not(None))
+        .where(
+            FactClaim.subject_id.in_(entity_ids),
+            FactClaim.retracted_at.is_not(None),
+        )
     )
     return int(total or 0)
+
+
+# 合并链的深度上限。自指由 CHECK 拦住了，多跳环路（A→B→A）只能在这里兜：
+# 超过深度就停在当前行，把它当根——不抛异常，因为一个坏指针不该让整条时间线
+# 变成 500；但也不无限跟，那才是真正的危险。
+MAX_MERGE_DEPTH = 8
+
+
+@dataclass(slots=True)
+class EntityGroup:
+    """一次查询要覆盖的一组实体：一个根，加上被合并到它名下的所有写法。"""
+
+    root: Entity
+    members: list[Entity]
+
+    @property
+    def ids(self) -> list[uuid.UUID]:
+        return [member.id for member in self.members]
+
+    @property
+    def merged_names(self) -> list[str]:
+        """除根以外的写法。用来在结果里交代「这个数字覆盖了哪些名字」。"""
+        return [member.name for member in self.members if member.id != self.root.id]
+
+
+def _root_id(start: uuid.UUID, parent: dict[uuid.UUID, uuid.UUID]) -> uuid.UUID:
+    """沿 `merged_into` 向上找根。环路与超深都停在当前行，不抛。"""
+
+    seen = {start}
+    current = start
+    for _ in range(MAX_MERGE_DEPTH):
+        nxt = parent.get(current)
+        if nxt is None or nxt in seen:
+            return current
+        seen.add(nxt)
+        current = nxt
+    return current
+
+
+def build_entity_group(entity: Entity, rows: list[Entity]) -> EntityGroup:
+    """纯函数版本：给定起点与全部实体行，算出它所在的合并组。
+
+    单独拆出来是因为项目没有测试库。合并的难点全在**闭包怎么算**（链式、环路、
+    跨写法），不在 SQL 上——把这段放成纯函数，就能不连库钉住它。
+    """
+
+    by_id = {row.id: row for row in rows}
+    # 兜底：调用方给的 rows 里可能不含起点（例如只查了子行）
+    by_id.setdefault(entity.id, entity)
+    parent = {
+        row.id: row.merged_into for row in by_id.values() if row.merged_into is not None
+    }
+
+    root_id = _root_id(entity.id, parent)
+    root = by_id.get(root_id, entity)
+    others = [
+        row
+        for row in by_id.values()
+        if row.id != root_id and _root_id(row.id, parent) == root_id
+    ]
+    # 排序只为让结果稳定（SQL 里 IN 的顺序会影响执行计划，不影响语义）
+    others.sort(key=lambda row: row.name)
+    return EntityGroup(root=root, members=[root, *others])
+
+
+async def resolve_entity_group(
+    session: AsyncSession, name: str, kind: str | None = None
+) -> EntityGroup | None:
+    """按名字找到**一组**实体：它自己 + 所有被合并到同一根下的写法。
+
+    为什么要多扫一次全表：合并信息只存在于 `merged_into` 这一列上，而它可能挂在
+    组里任意一行（`OpenAI Inc` 指向 `OpenAI`，`NVIDIA` 指向 `英伟达`），从起点出发
+    单点查不出全貌。实体在千级，`resolve_entity` 本来就有一次全表兜底，这里沿用
+    同一个取舍——代价是常数，收益是「查一个名字不会只拿到一半事实」。
+    """
+
+    entity = await resolve_entity(session, name, kind)
+    if entity is None:
+        return None
+    rows = list((await session.execute(select(Entity))).scalars().all())
+    return build_entity_group(entity, rows)
 
 
 async def entity_timeline(
@@ -169,17 +262,22 @@ async def entity_timeline(
 
     被撤回的事实（`retracted_at` 非空）一律不返回：撤回的含义是「我们不再声称」，
     它不该继续参与时间线排序，也不该进 `find_overlaps` 制造假冲突。
+
+    查询按**合并组**而不是单个 id 走：`NVIDIA` 与 `英伟达` 在 `normalize_key` 下
+    必然分成两行，两行各有各的事实。只查一行会得到一份看起来完整、实际缺一半的
+    时间线——这种「安静地缺一半」比直接报错更糟。
     """
 
-    entity = await resolve_entity(session, name)
-    if entity is None:
+    group = await resolve_entity_group(session, name)
+    if group is None:
         return None
+    entity = group.root
 
     stmt = (
         select(FactClaim, Document)
         .join(Document, Document.id == FactClaim.document_id)
         .where(
-            FactClaim.subject_id == entity.id,
+            FactClaim.subject_id.in_(group.ids),
             FactClaim.retracted_at.is_(None),
         )
         .order_by(FactClaim.valid_from.desc().nullslast(), FactClaim.recorded_at.desc())
@@ -194,7 +292,10 @@ async def entity_timeline(
     rows = (await session.execute(stmt)).all()
 
     result = TimelineResult(
-        entity_id=entity.id, entity_name=entity.name, entity_kind=entity.kind
+        entity_id=entity.id,
+        entity_name=entity.name,
+        entity_kind=entity.kind,
+        merged_names=group.merged_names,
     )
     for fact, document in rows:
         entry = _to_entry(fact, document)
@@ -203,7 +304,7 @@ async def entity_timeline(
         else:
             result.entries.append(entry)
 
-    result.retracted_count = await _count_retracted(session, entity.id)
+    result.retracted_count = await _count_retracted(session, group.ids)
     result.overlaps = find_overlaps(result.entries)
     return result
 
@@ -221,17 +322,23 @@ async def as_of(
     被撤回的事实不参与判定（`retracted_at` 非空）。这不是「删掉它」，而是
     「不再拿它当回答依据」——两者在 `as_of` 上的区别非常具体：撤回一条错的
     CEO 记录之后，那天的答案是「没有记录」，而不是「那时不是他」。
+
+    同样按合并组查询。这里合并的收益比 `entity_timeline` 更直接：
+    `NVIDIA` 名下记着「Colette Kress 任 CEO」，`英伟达` 名下记着「黄仁勋任 CEO」，
+    不合并的话两边各自都「没有冲突」，`as_of` 也不会报重叠——**冲突被写法切开了**。
     """
 
-    entity = await resolve_entity(session, name)
-    if entity is None:
+    group = await resolve_entity_group(session, name)
+    if group is None:
         return None
+    entity = group.root
+    group_ids = group.ids
 
     stmt = (
         select(FactClaim, Document)
         .join(Document, Document.id == FactClaim.document_id)
         .where(
-            FactClaim.subject_id == entity.id,
+            FactClaim.subject_id.in_(group_ids),
             FactClaim.retracted_at.is_(None),
             FactClaim.valid_from.is_not(None),
             FactClaim.valid_from <= on,
@@ -243,7 +350,10 @@ async def as_of(
     rows = (await session.execute(stmt)).all()
 
     result = TimelineResult(
-        entity_id=entity.id, entity_name=entity.name, entity_kind=entity.kind
+        entity_id=entity.id,
+        entity_name=entity.name,
+        entity_kind=entity.kind,
+        merged_names=group.merged_names,
     )
     for fact, document in rows:
         result.entries.append(_to_entry(fact, document))
@@ -254,7 +364,7 @@ async def as_of(
         select(FactClaim, Document)
         .join(Document, Document.id == FactClaim.document_id)
         .where(
-            FactClaim.subject_id == entity.id,
+            FactClaim.subject_id.in_(group_ids),
             FactClaim.retracted_at.is_(None),
             FactClaim.valid_from.is_(None),
         )
@@ -263,7 +373,7 @@ async def as_of(
     for fact, document in (await session.execute(undated_stmt)).all():
         result.undated.append(_to_entry(fact, document))
 
-    result.retracted_count = await _count_retracted(session, entity.id)
+    result.retracted_count = await _count_retracted(session, group_ids)
     result.overlaps = find_overlaps(result.entries)
     return result
 

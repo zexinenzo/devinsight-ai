@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import uuid
 from argparse import Namespace
 from pathlib import Path
 
@@ -314,3 +315,67 @@ def test_retract_rejects_bad_replaced_by() -> None:
     plan = repair.parse_retract_args(_retract_args(replaced_by="nope"))
     assert plan.error
     assert "replaced-by" in plan.error
+
+
+# --- merge：实体合并的参数与成环检查 ---------------------------------------
+
+
+def _merge_args(**overrides) -> Namespace:
+    options = {
+        "id": "7beeb987-93d1-4773-8651-3b2c811c7e30",
+        "into": "1420dc3c-e9e2-484b-adce-eee36aac8fb6",
+        "undo": False,
+        "dry_run": True,
+    }
+    options.update(overrides)
+    return Namespace(**options)
+
+
+def test_merge_rejects_self_target() -> None:
+    """自指在数据库也有 CHECK，但要在**发语句之前**拒掉：
+    让人看到一条 psycopg 的约束冲突，远不如直接说「不能并到自己」。"""
+    same = "7beeb987-93d1-4773-8651-3b2c811c7e30"
+    plan = repair.parse_merge_args(_merge_args(id=same, into=same))
+    assert plan.error
+    assert "自己" in plan.error
+
+
+def test_merge_rejects_bad_uuid() -> None:
+    plan = repair.parse_merge_args(_merge_args(into="nope"))
+    assert plan.error
+    assert "UUID" in plan.error
+
+
+def test_merge_accepts_distinct_entities() -> None:
+    plan = repair.parse_merge_args(_merge_args())
+    assert plan.error == ""
+    assert plan.dup != plan.root
+
+
+def test_merge_cycle_is_refused_before_writing() -> None:
+    """A→B 已经存在时，再写 B→A 会成环。
+
+    CHECK 拦不住这个：它只看本行，A 与 B 各自都不指向自己。而环路写进库之后，
+    向上找根的查询只能靠深度上限硬停——那时已经没人知道哪一行才是真的根。
+    """
+    a, b = uuid.uuid4(), uuid.uuid4()
+    parent = {b: a}  # b 已并到 a 名下
+    error = repair.cycle_error(dup=a, root=b, parent=parent)
+    assert error
+    assert "成环" in error
+
+
+def test_merge_chain_without_cycle_is_allowed() -> None:
+    """链式本身不是错：合并是分批做的，先并一层、再并一层很常见。"""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    parent = {c: b}  # c → b，现在要把 a → c
+    assert repair.cycle_error(dup=a, root=c, parent=parent) == ""
+
+
+def test_merge_refuses_to_extend_a_chain_that_already_loops() -> None:
+    """目标所在的那条链本身有环时，先修它，不要往上加。"""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    parent = {a: b, b: a}
+    error = repair.cycle_error(dup=uuid.uuid4(), root=a, parent=parent)
+    assert error
+    assert "环" in error
