@@ -208,6 +208,13 @@ class Document(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # --- 阶段 8：抽取状态 ---
+    # NULL = 还没被判定过；有值 = 模型已给出确定回答（抽到事实，或明确「本文没有事实」）。
+    # 不能靠「fact_claims 里有没有行」判断：无事实的文档一行都没有，EXISTS 永远为假，
+    # 于是那批文档每轮都会被重新送去模型。失败（截断/空响应/格式错）刻意不回填，
+    # 否则一篇被截断的文档会被永久跳过。
+    facts_extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     source: Mapped[Source] = relationship(back_populates="documents")
 
 

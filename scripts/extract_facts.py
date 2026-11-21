@@ -47,6 +47,14 @@
 所以又多两件事：解析失败时**把模型自己的错误输出放回上下文再要一次**（温度已经是 0，
 原样重发只会得到同一段废话），以及**把原始输出的前 120 字打出来**——
 只报「无法解析」等于把最需要的信息丢掉，写前言、尾逗号、空串三种情况的修法完全不同。
+
+**7. 候选集要记住「抽过没有」，而且不能靠事实行来记。** 最早 `pick_documents` 只有
+「有正文 + 按发布时间倒序取最新 N 篇」两个条件，于是每轮都把同一批文档重抽一遍：
+上一轮 238 条抽出里 90 条是重复，38% 的调用白烧。更贵的是那 342 篇「无事实」文档——
+它们一行事实都没写，用 `fact_claims` 有没有行来判断永远是「没抽过」，每轮重判一次。
+所以状态记在 `documents.facts_extracted_at` 上，且**只记确定回答**：抽到事实、或明确
+「本文没有」都算；截断/空响应/格式错不算，否则一篇被截断的文档会被永久跳过。
+改提示词或换模型要全量重来，用 `--reprocess` 显式打开，不要让默认行为悄悄变成重抽。
 """
 
 from __future__ import annotations
@@ -76,7 +84,7 @@ from app.services.fact_extraction import (
 )
 from app.services.llm_service import ChatMessage, LLMUnavailable, require_llm
 from app.services.timeline_service import PREDICATES, normalize_key
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 MAX_BODY_CHARS = 3000
@@ -103,6 +111,8 @@ class Stats:
     evidence_exact: int = 0
     evidence_partial: int = 0
     evidence_missing: int = 0
+    # 本次被记上 facts_extracted_at 的文档数：下轮不会再被选中
+    marked: int = 0
 
 
 async def resolve_or_create_entity(session, name: str, kind: str) -> Entity | None:
@@ -122,10 +132,18 @@ async def resolve_or_create_entity(session, name: str, kind: str) -> Entity | No
     ).scalar_one_or_none()
 
 
-async def pick_documents(session, args) -> list[Document]:
+def build_documents_query(args):
+    """候选文档的取法。单独拎出来是为了能在不连数据库的情况下断言它的形状。
+
+    默认排除 `facts_extracted_at IS NOT NULL`：模型已经把这篇判定过了，
+    再送一次只会得到同一段输出，然后撞上唯一约束。`--reprocess` 打开时才全量重抽
+    （改提示词或换模型时用，那是唯一需要重抽的场景）。
+    """
     stmt = select(Document).where(
         or_(Document.content_text.is_not(None), Document.summary.is_not(None))
     )
+    if not getattr(args, "reprocess", False):
+        stmt = stmt.where(Document.facts_extracted_at.is_(None))
     if args.since:
         stmt = stmt.where(Document.published_at >= datetime.fromisoformat(args.since))
     if args.keyword:
@@ -133,7 +151,11 @@ async def pick_documents(session, args) -> list[Document]:
         stmt = stmt.where(or_(Document.title.ilike(pattern), Document.summary.ilike(pattern)))
     # 有正文的优先：摘要常常只有「某公司发布了新产品」，缺日期和细节
     stmt = stmt.order_by(Document.published_at.desc().nullslast()).limit(args.limit)
-    return list((await session.execute(stmt)).scalars().all())
+    return stmt
+
+
+async def pick_documents(session, args) -> list[Document]:
+    return list((await session.execute(build_documents_query(args))).scalars().all())
 
 
 def document_text(document: Document) -> str:
@@ -227,6 +249,11 @@ async def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--dry-run", action="store_true", help="只打印抽取结果，不写库")
     group.add_argument("--apply", action="store_true", help="写库")
+    parser.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="连已判定过的文档一起重抽（只在改了提示词或换了模型时用；默认跳过）",
+    )
     args = parser.parse_args()
 
     try:
@@ -239,7 +266,8 @@ async def main() -> int:
     stats = Stats()
     async with session_scope() as session:
         documents = await pick_documents(session, args)
-        print(f"待处理文档 {len(documents)} 篇（limit={args.limit}）")
+        scope = "含已判定过的（--reprocess）" if args.reprocess else "跳过已判定过的"
+        print(f"待处理文档 {len(documents)} 篇（limit={args.limit}，{scope}）")
 
         for index, document in enumerate(documents, start=1):
             stats.documents += 1
@@ -273,6 +301,14 @@ async def main() -> int:
                     preview = re.sub(r"\s+", " ", outcome.content).strip()[:120]
                     print(f"      原始输出：{preview or '（空字符串）'}")
                 continue
+            # 模型已经给出确定回答，这篇不必再送一次。放在「无事实」分支之前是有意的：
+            # 那 342 篇无事实文档没有任何事实行可查，这个时间戳是它们唯一的痕迹。
+            # 上面失败（facts is None）的分支刻意不回填——那篇还没被判定过，下轮必须重试，
+            # 回填等于把一篇被截断的文档永久跳过。
+            if args.apply:
+                document.facts_extracted_at = func.now()
+                stats.marked += 1
+
             if not outcome.facts:
                 stats.empty_documents += 1
                 print(f"[{index}] {document.title[:40]} 本文无可抽事实")
@@ -366,7 +402,8 @@ async def main() -> int:
         "抽取失败 {unparsed} 篇（截断 {unparsed_truncated} / 空响应 {unparsed_empty} / "
         "格式 {unparsed_format}），"
         "非明说日期 {undated} 条，"
-        "证据 exact/partial/missing = {evidence_exact}/{evidence_partial}/{evidence_missing}".format(
+        "证据 exact/partial/missing = {evidence_exact}/{evidence_partial}/{evidence_missing}，"
+        "已标记 {marked} 篇（下轮不再重抽）".format(
             **asdict(stats)
         )
     )
