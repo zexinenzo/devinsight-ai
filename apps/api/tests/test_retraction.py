@@ -14,9 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import CheckConstraint
-
 from app.db.models import FactClaim
+from sqlalchemy import CheckConstraint
 
 VERSIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
 MIGRATION = VERSIONS / "0010_fact_claim_retraction.py"

@@ -626,6 +626,14 @@ def _render_timeline(heading: str, result: timeline_service.TimelineResult) -> s
         lines.append("")
         lines.append("区间冲突（同一谓词下两件事同时成立，引用时要交代口径）：")
         lines.extend(f"- {item}" for item in result.overlaps[:5])
+    if result.retracted_count:
+        # 只报数量、不给内容：撤回的前提是判定不可靠，把内容再摆出来等于
+        # 让模型接着引用它。但数量必须说——「撤过」和「从没有过」是两件事。
+        lines.append("")
+        lines.append(
+            f"另有 {result.retracted_count} 条事实曾被记录，但已被标记为撤回"
+            "（判定不可靠），不在上面的任何一条里，也不应作为回答依据。"
+        )
     return "\n".join(lines)
 
 
@@ -653,6 +661,23 @@ def make_entity_timeline() -> ToolHandler:
                 ),
             )
         if not result.entries and not result.undated:
+            if result.retracted_count:
+                # 「全被撤回」和「从来没抽过」看起来都是空，但含义完全相反：
+                # 前者说明库里有东西，只是我们不再信它。
+                return ToolOutcome(
+                    ok=False,
+                    content=(
+                        f"实体「{result.entity_name}」的 {result.retracted_count} 条事实"
+                        "已全部被标记为撤回（判定不可靠），当前没有可引用的事实。"
+                        "不要把撤回的条目当成「已确认发生过」来回答。"
+                    ),
+                    meta={
+                        "entity": result.entity_name,
+                        "dated": 0,
+                        "undated": 0,
+                        "retracted": result.retracted_count,
+                    },
+                )
             return ToolOutcome(
                 ok=False,
                 content=(
@@ -668,6 +693,7 @@ def make_entity_timeline() -> ToolHandler:
                 "dated": result.dated_count,
                 "undated": result.undated_count,
                 "conflicts": len(result.overlaps),
+                "retracted": result.retracted_count,
             },
         )
 
@@ -698,14 +724,25 @@ def make_facts_as_of() -> ToolHandler:
         if not result.entries:
             # 空快照是最容易被误读的结果：它不是「那天什么都没发生」，
             # 而是「没有一条事实的时间区间覆盖那天」。区别必须说出来。
+            parts = [
+                f"{head}：{result.entity_name} 没有一条事实的生效区间覆盖这一天。",
+                f"这不等于当天无事发生——另有 {result.undated_count} 条事实时间未知，"
+                "无法判断它们当时是否成立。",
+            ]
+            if result.retracted_count:
+                parts.append(
+                    f"此外该实体有 {result.retracted_count} 条事实已被标记为撤回，"
+                    "它们不参与任何时点判断。"
+                )
             return ToolOutcome(
                 ok=True,
-                content=(
-                    f"{head}：{result.entity_name} 没有一条事实的生效区间覆盖这一天。"
-                    f"这不等于当天无事发生——另有 {result.undated_count} 条事实时间未知，"
-                    "无法判断它们当时是否成立。"
-                ),
-                meta={"entity": result.entity_name, "dated": 0, "undated": result.undated_count},
+                content="".join(parts),
+                meta={
+                    "entity": result.entity_name,
+                    "dated": 0,
+                    "undated": result.undated_count,
+                    "retracted": result.retracted_count,
+                },
             )
         return ToolOutcome(
             ok=True,
@@ -714,6 +751,7 @@ def make_facts_as_of() -> ToolHandler:
                 "entity": result.entity_name,
                 "dated": result.dated_count,
                 "undated": result.undated_count,
+                "retracted": result.retracted_count,
             },
         )
 

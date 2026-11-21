@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Document, Entity, FactClaim
@@ -97,6 +97,10 @@ class TimelineResult:
     undated: list[TimelineEntry] = field(default_factory=list)
     # 同一谓词下区间相交的事实（两个 CEO 同时在职之类），是数据冲突信号
     overlaps: list[str] = field(default_factory=list)
+    # 被撤回的条数（只报数量，不列内容）。撤回的条目一律不出现在 entries /
+    # undated / overlaps 里，但**数量必须露出来**：否则「我们撤了一条」和
+    # 「这条从来没被记录过」在调用方看来完全一样，而前者恰恰需要交代。
+    retracted_count: int = 0
 
     @property
     def dated_count(self) -> int:
@@ -137,6 +141,22 @@ async def resolve_entity(
     return None
 
 
+async def _count_retracted(session: AsyncSession, entity_id: uuid.UUID) -> int:
+    """只数撤回条数，不取内容。
+
+    查询层把撤回项全部过滤掉了，于是「我们撤了一条」和「从来没记过」在结果里
+    长得一模一样。必须把数量说出来，否则 as_of 会安静地少掉一条本该交代的信息——
+    而「安静地少一条」正是这个项目最忌讳的错误。
+    """
+
+    total = await session.scalar(
+        select(func.count())
+        .select_from(FactClaim)
+        .where(FactClaim.subject_id == entity_id, FactClaim.retracted_at.is_not(None))
+    )
+    return int(total or 0)
+
+
 async def entity_timeline(
     session: AsyncSession,
     name: str,
@@ -145,7 +165,11 @@ async def entity_timeline(
     end: date | None = None,
     limit: int = 200,
 ) -> TimelineResult | None:
-    """某实体的时间线。有日期的按时间倒序，无日期的单独归入 `undated`。"""
+    """某实体的时间线。有日期的按时间倒序，无日期的单独归入 `undated`。
+
+    被撤回的事实（`retracted_at` 非空）一律不返回：撤回的含义是「我们不再声称」，
+    它不该继续参与时间线排序，也不该进 `find_overlaps` 制造假冲突。
+    """
 
     entity = await resolve_entity(session, name)
     if entity is None:
@@ -154,7 +178,10 @@ async def entity_timeline(
     stmt = (
         select(FactClaim, Document)
         .join(Document, Document.id == FactClaim.document_id)
-        .where(FactClaim.subject_id == entity.id)
+        .where(
+            FactClaim.subject_id == entity.id,
+            FactClaim.retracted_at.is_(None),
+        )
         .order_by(FactClaim.valid_from.desc().nullslast(), FactClaim.recorded_at.desc())
         .limit(limit)
     )
@@ -176,6 +203,7 @@ async def entity_timeline(
         else:
             result.entries.append(entry)
 
+    result.retracted_count = await _count_retracted(session, entity.id)
     result.overlaps = find_overlaps(result.entries)
     return result
 
@@ -189,6 +217,10 @@ async def as_of(
     注意这是半开区间——`valid_to` 当天已经不再成立。选半开而不是闭区间，是因为
     同一个职位前后两任的交接日只有一天，闭区间会让两任在那天同时在职，
     制造一条假冲突。
+
+    被撤回的事实不参与判定（`retracted_at` 非空）。这不是「删掉它」，而是
+    「不再拿它当回答依据」——两者在 `as_of` 上的区别非常具体：撤回一条错的
+    CEO 记录之后，那天的答案是「没有记录」，而不是「那时不是他」。
     """
 
     entity = await resolve_entity(session, name)
@@ -200,6 +232,7 @@ async def as_of(
         .join(Document, Document.id == FactClaim.document_id)
         .where(
             FactClaim.subject_id == entity.id,
+            FactClaim.retracted_at.is_(None),
             FactClaim.valid_from.is_not(None),
             FactClaim.valid_from <= on,
             or_(FactClaim.valid_to.is_(None), FactClaim.valid_to > on),
@@ -220,12 +253,17 @@ async def as_of(
     undated_stmt = (
         select(FactClaim, Document)
         .join(Document, Document.id == FactClaim.document_id)
-        .where(FactClaim.subject_id == entity.id, FactClaim.valid_from.is_(None))
+        .where(
+            FactClaim.subject_id == entity.id,
+            FactClaim.retracted_at.is_(None),
+            FactClaim.valid_from.is_(None),
+        )
         .limit(limit)
     )
     for fact, document in (await session.execute(undated_stmt)).all():
         result.undated.append(_to_entry(fact, document))
 
+    result.retracted_count = await _count_retracted(session, entity.id)
     result.overlaps = find_overlaps(result.entries)
     return result
 
