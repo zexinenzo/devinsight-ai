@@ -818,16 +818,18 @@ def tie_message(old: FactView, new: FactView) -> str:
     同时要给对药方。实跑 `--list` 的 7 对候选里 6 对是这个形态，其中
     `released_version` 的三组（nginx 1.30.7/1.31.9、DaisyRose 的三种量化权重、
     GPT-6.2 的 Astra/Sol）根本不是换代，是同时存在——把它们往 `--on` 上引，
-    等于教人给并存的东西编一个结束日。
+    等于教人给并存的东西编一个结束日。所以第二句留着一个出口：漏掉的多值谓词
+    会在这里显形，而不是被 `--on` 掩盖过去。修完名单后只剩 `ceo` 一个实例。
     """
 
     if old.valid_from is None or old.valid_from != new.valid_from:
         return ""
     day = old.valid_from.isoformat()
     return (
-        f"起始日都是 {day}，排不出谁是谁的前任，箭头方向不作数。两种可能："
-        "① 这两条本来就并存（谓词不是单值，加进 MULTI_VALUED_PREDICATES 后它会消失）；"
-        "② 确实是换代，但库里两条都只有发文日（用 --on 指定卸任日，别猜）。"
+        f"起始日都是 {day}，排不出谁是谁的前任，箭头方向不作数。"
+        "分两种谓词看：`ceo` 这种「同一时刻只能有一个人」的，说明库里缺真实交接日"
+        "（用 --on 指定，别猜）；`released_version` 这种「可以同时存在多条」的，"
+        "本来就不该被两两比较（加进 MULTI_VALUED_PREDICATES 后它会消失）。"
     )
 
 
