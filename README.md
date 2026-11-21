@@ -911,6 +911,25 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 1 条宾语过长被拒），入库 148 条，重复 90 条，无事实 342 篇，抽取失败 13 篇
 （全为 max_tokens 截断），非明说日期 167 条，**证据 exact/partial/missing = 238/0/0**。
 
+### 修复：撤回，不删除
+
+```bash
+.venv/bin/python scripts/repair_facts.py audit                        # 只读，按可疑程度分三档
+.venv/bin/python scripts/repair_facts.py audit --format csv --out .tmp/audit.csv
+.venv/bin/python scripts/repair_facts.py retract --id <uuid> --reason "…"   # 加 --dry-run 预演
+.venv/bin/python scripts/repair_facts.py retract --id <uuid> --undo         # 恢复
+```
+
+`audit` 只做 `SELECT`。判定与执行必须分开——判定结果一旦能直接落库，就没有第二双眼睛看过它。
+
+**撤回不是删除。** `retracted_at` 表达「我们不再声称这条」，`valid_to` 仍然只表达「这件事
+在现实世界里什么时候不再成立」。两个轴混用会让 `as_of("2025-11-19")` 系统性撒谎。查询层
+一律过滤撤回项，但 `retracted_count` 必须报出来——**内容不露、数量要露**。
+
+全量 270 条审计结果：① 形状不符（宾语是许可证）3 条、② 宾语槽位错位（`founded` 填人名、
+`funded` 填投资方）8 条、③ 证据指证谓词 1 条。① 已全部撤回，②③ 是人工队列。
+**能机械判定的刚过 1%**，所以判错的代价必须接近零，这是选撤回而不是删除的唯一理由。
+
 ### 诚实边界
 
 - **时间线没有 REST 端点。** 只通过 Agent 工具（`entity_timeline` / `facts_as_of`）暴露，
@@ -922,7 +941,10 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 - **对称谓词只挂一侧**：`A --partnered_with--> B` 记一条，查 B 时看不到 A。
   `fact_claims.object_entity_id` 预留了位置但没填。
 - **`founded` / `open_sourced` 的宾语类型未约束**，已入库的错条目（`英伟达 --founded--> 黄仁勋`、
-  `Fardesk --open_sourced--> Apache-2.0`）需要先有删除与合并逻辑才能修，见「已知边界」。
+  `深微芯创 --funded--> 深产投`）还在库里，属人工队列——判定它们的疑点在语义不在形状，
+  代码判不了。能机械判定的那 3 条（宾语是许可证）已撤回。
+- **抽取有过状态位，但只回填了一部分。** `documents.facts_extracted_at` 让「抽过」被记住，
+  产过事实的文档已回填；历史上那批「无事实」文档没有痕迹可反推，会在下一轮被再判一次。
 
 完整推导见教程第 8 章。
 
