@@ -360,6 +360,11 @@ class FactClaim(Base):
     | `superseded_by` | 世界 | 被哪条新事实取代（因为世界变了） |
     | `retracted_at` | 认识 | 我们什么时候不再声称这条记录（因为它是错的） |
 
+    `valid_to` 配一个 `valid_to_reason`（迁移 0013）：闭合区间必须留下依据。
+    这一列连同 `superseded_by` 一起，是 `repair_facts.py supersede` 唯一的写入口。
+    没有它的后果不是「少一列」，而是 `valid_to` 变成谁都能徒手改的日期——
+    填错一天不报错，只在某个历史时点答错，而**没有人会去看那一天**。
+
     撤回不删除，是因为判错无法挽回：行没了，证据链就没了，时间线少一条的表现是
     「这件事没发生」，而不是「这里有个待修的洞」。见 `docs/阶段8-数据修复设计.md`。
 
@@ -395,6 +400,12 @@ class FactClaim(Base):
             "retracted_at IS NULL OR retracted_reason IS NOT NULL",
             name="retraction",
         ),
+        # 闭合区间同理（迁移 0013）。和上面那条的区别是轴：撤回是认识轴，
+        # 闭合是世界轴。日期比理由更容易被当成「客观的」，所以更需要这句理由。
+        CheckConstraint(
+            "valid_to IS NULL OR valid_to_reason IS NOT NULL",
+            name="closure",
+        ),
         # 主查询是「某实体时间线按时间倒序」，联合索引让排序不必再走 sort
         Index("ix_fact_claims_subject_valid", "subject_id", text("valid_from DESC")),
         Index("ix_fact_claims_predicate", "predicate"),
@@ -415,6 +426,9 @@ class FactClaim(Base):
     # 现实时间。允许 NULL：报道可能完全不提时间，宁可留空也不拿采集时间冒充
     valid_from: Mapped[date | None] = mapped_column(Date)
     valid_to: Mapped[date | None] = mapped_column(Date)
+    # 为什么在这一天结束。CHECK 强制「有 valid_to 就必须有理由」，
+    # 由 `repair_facts.py supersede` 自动写成「被 <宾语>(<起始日>) 取代」
+    valid_to_reason: Mapped[str | None] = mapped_column(Text)
     valid_from_source: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'unknown'")
     )

@@ -6,6 +6,8 @@
     .venv/bin/python scripts/repair_facts.py retract --id <uuid> --undo   # 恢复采信
     .venv/bin/python scripts/repair_facts.py merge --id <uuid> --into <uuid>       # 合并实体
     .venv/bin/python scripts/repair_facts.py merge --id <uuid> --undo             # 解除合并
+    .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新>        # 闭合区间
+    .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新> --undo
 
 **`audit` 为什么只读。** 判定与执行必须分开，否则就成了「让模型给自己判卷」——
 判定结果一旦能直接落库，就没有第二双眼睛看过它。中间那一步是人。
@@ -19,6 +21,13 @@
 **`merge` 为什么写指针而不改 `subject_id`。** 触发器直接拒改 `subject_id`；而且改完
 就再也查不到「这条事实当初挂在哪种写法下」。指针可逆，事实一行不动，`--undo` 就还原。
 `entities.aliases` 那一列就是反例：它存在、也被读，但**没人往里写**，于是等于没有。
+
+**`supersede` 补的是时间轴的右半边。** `valid_to` 从建表起就能改，但没有写入方，
+于是每条事实都是「至今成立」——两个 CEO 同时在职，`as_of` 只能两个都返回。
+这条不能撤回：撤回的意思是「我们不再声称」，而前任在任是事实，撤掉它等于让
+`as_of` 说「那天不是他」。所以这里做的是**闭合区间**，要写 `valid_to` +
+`superseded_by` + `valid_to_reason` 三列（迁移 0013 的 CHECK 要求有日期必有理），
+`--undo` 把三列一起清回去。
 
 三档判定见设计稿第 5 节。核心事实是：270 条里能自动判定的只有 3 条，刚过 1%。所以
 `audit` 的产出不是「一份待删清单」，而是**一份按可疑程度排好序的人工队列**——
@@ -48,7 +57,8 @@ import csv
 import re
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -57,7 +67,12 @@ sys.path.insert(0, str(API_DIR))
 
 from app.db.models import Entity, FactClaim
 from app.db.session import session_scope
-from app.services.timeline_service import DATE_SOURCE_LABELS, MAX_MERGE_DEPTH, PREDICATES
+from app.services.timeline_service import (
+    DATE_SOURCE_LABELS,
+    MAX_MERGE_DEPTH,
+    PREDICATES,
+    build_entity_group,
+)
 from sqlalchemy import func, select
 
 # ① 形状：许可证标识符。没有任何谓词把许可证声明为合法宾语——
@@ -630,9 +645,265 @@ async def run_merge(args) -> int:
         return 0
 
 
+# --- supersede：闭合区间（时间轴的右半边）-----------------------------------
+
+
+@dataclass(slots=True)
+class FactView:
+    """判定一条事实需要的几个字段。
+
+    单独拆出来只有一个理由：`plan_closure` 必须能不连库被测试。写库那条路径出错
+    就是改坏历史数据，而它能被测试的唯一方式是把判定从 SQL 旁边摘出来。
+    """
+
+    id: uuid.UUID
+    predicate: str
+    object_text: str
+    valid_from: date | None
+    valid_to: date | None
+
+
+@dataclass(slots=True)
+class ClosurePlan:
+    cutoff: date | None = None
+    reason: str = ""
+    warnings: list[str] = field(default_factory=list)
+    error: str = ""
+    noop: bool = False
+
+
+def plan_closure(
+    old: FactView,
+    new: FactView | None,
+    *,
+    on: date | None = None,
+    reason: str = "",
+    today: date | None = None,
+) -> ClosurePlan:
+    """算出这条事实该在哪天结束，以及该不该拒绝这次闭合。
+
+    判据只有一句话：**闭合日要落在「旧的不再成立」和「新的开始成立」之间有据可查
+    的那一天**。没有依据时宁可报错——`valid_to` 填错一天不会报错，只会在某个历史
+    时点答错，而那一天没有人会去查。
+    """
+    if new is not None:
+        if new.id == old.id:
+            return ClosurePlan(error="不能拿一条事实去取代它自己。")
+        if new.predicate != old.predicate:
+            return ClosurePlan(
+                error=(
+                    f"两条的谓词不同（{old.predicate} / {new.predicate}）。"
+                    "「世界变了」只发生在同一个谓词上：CEO 换人闭合上一条 ceo，"
+                    "不能用一条融资记录去闭合一条人事记录。"
+                )
+            )
+
+    cutoff = on if on is not None else (new.valid_from if new is not None else None)
+    if cutoff is None:
+        return ClosurePlan(
+            error=(
+                "不知道该闭合到哪天：被取代的那条没有 valid_from。"
+                "用 --on YYYY-MM-DD 显式指定，并把它写进 --reason。"
+            )
+        )
+
+    if old.valid_to == cutoff:
+        return ClosurePlan(cutoff=cutoff, reason=reason, noop=True)
+    if old.valid_to is not None:
+        return ClosurePlan(
+            error=(
+                f"这条已经闭合在 {old.valid_to.isoformat()}，不能直接改成 "
+                f"{cutoff.isoformat()}——先 --undo 再重来，免得改了一次没人知道。"
+            )
+        )
+
+    if (
+        new is not None
+        and new.valid_from is not None
+        and old.valid_from is not None
+        and new.valid_from == old.valid_from
+        and cutoff == old.valid_from
+    ):
+        # 两条的起始日是同一��。这多半不是巧合，而是两条都用了「发文时间兜底」
+        # （`valid_from_source = published`）——报道里写 `former CEO` 时，
+        # 它的真实上任日比发文日早得多，可库里只有发文日。
+        # 这时闭合会在同一天造出空区间，而**硬填一个日期等于编造交接日**。
+        return ClosurePlan(
+            error=(
+                f"两条的起始日都是 {old.valid_from.isoformat()}，无法用它把区间分开——"
+                "这个日期多半是发文时间兜底，不是真实的交接日。"
+                "确实知道卸任日就 --on 指定；不知道就留着这条冲突，"
+                "编一个日期比留一条能被看见的冲突更糟。"
+            )
+        )
+
+    if old.valid_from is not None and cutoff <= old.valid_from:
+        return ClosurePlan(
+            error=(
+                f"闭合日 {cutoff.isoformat()} 不晚于这条的起始日 "
+                f"{old.valid_from.isoformat()}，区间会退化成空——迁移 0009 的 period "
+                "CHECK 会拒，它拒得对。"
+            )
+        )
+
+    warnings: list[str] = []
+    if old.valid_from is None:
+        warnings.append(
+            "这条没有 valid_from，闭合它不会改变 as_of 的结果（它本来就不参与判定）"
+        )
+    if new is not None and new.valid_from is not None and cutoff != new.valid_from:
+        warnings.append(
+            f"--on {cutoff.isoformat()} 与被取代那条的起始日 "
+            f"{new.valid_from.isoformat()} 不同：两者之间会留一段「谁都不在任」的空档"
+        )
+    if new is not None and new.valid_to is not None and cutoff > new.valid_to:
+        return ClosurePlan(
+            error=(
+                f"闭合日 {cutoff.isoformat()} 落在新记录结束之后"
+                f"（{new.valid_to.isoformat()}），说明这两条根本不是前后任。"
+            )
+        )
+    if today is not None and cutoff > today:
+        warnings.append(
+            f"闭合日 {cutoff.isoformat()} 在未来，确认这是已知的卸任日而不是推测"
+        )
+
+    if not reason:
+        if new is None:
+            return ClosurePlan(
+                error="没有 --by 就必须给 --reason：没有指针可以指认依据，全靠这句话。"
+            )
+        new_from = new.valid_from.isoformat() if new.valid_from else "日期未知"
+        reason = f"被 {new.object_text}（{new_from}）取代"
+
+    return ClosurePlan(cutoff=cutoff, reason=reason, warnings=warnings)
+
+
+def parse_date_arg(value: str) -> date:
+    try:
+        return date.fromisoformat((value or "").strip())
+    except ValueError as exc:
+        raise ValueError(f"--on 应为 YYYY-MM-DD，收到 {value!r}") from exc
+
+
+def _view(fact: FactClaim) -> FactView:
+    return FactView(
+        id=fact.id,
+        predicate=fact.predicate,
+        object_text=fact.object_text,
+        valid_from=fact.valid_from,
+        valid_to=fact.valid_to,
+    )
+
+
+async def run_supersede(args) -> int:
+    """给一条事实补上结束日：`valid_to` + `valid_to_reason` + `superseded_by`。
+
+    **为什么这不是撤回**：撤回表达「我们不再声称这条」，属于认识轴；前任 CEO 曾经
+    在任是事实，撤掉它，`as_of("2026-03-01")` 会回答「当时不是他」。两个轴一旦混用，
+    `as_of` 就开始系统性地撒谎——而那正是双时间表唯一存在的理由。
+    """
+    try:
+        on = parse_date_arg(args.on) if args.on else None
+        old_id = uuid.UUID(args.id)
+        new_id = uuid.UUID(args.by) if args.by else None
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    async with session_scope() as session:
+        old = await session.get(FactClaim, old_id)
+        if old is None:
+            print(f"⚠ 库里没有这条 id：{old_id}", file=sys.stderr)
+            return 2
+        new = await session.get(FactClaim, new_id) if new_id is not None else None
+        if new_id is not None and new is None:
+            print(f"⚠ --by 指向的事实不存在：{new_id}", file=sys.stderr)
+            return 2
+
+        if args.undo:
+            if old.valid_to is None:
+                print("这条本来就没闭合，跳过。", file=sys.stderr)
+                return 0
+            kept = old.superseded_by
+            print(f"重开区间：{old.predicate} → {old.object_text}")
+            print(f"     原闭合于 {old.valid_to.isoformat()}（{old.valid_to_reason or '无理由'}）")
+            if not args.dry_run:
+                old.valid_to = None
+                old.valid_to_reason = None
+                if new is not None and kept == new.id:
+                    old.superseded_by = None
+            print("     → 已恢复为「至今」" + ("（dry-run，未写库）" if args.dry_run else ""))
+            return 0
+
+        plan = plan_closure(
+            _view(old), _view(new) if new is not None else None,
+            on=on, reason=args.reason, today=date.today(),
+        )
+        if plan.error:
+            print(plan.error, file=sys.stderr)
+            return 2
+
+        if new is not None and old.subject_id != new.subject_id:
+            # 合并之后同一个实体的两行仍然是两个 subject_id（指针不改外键），
+            # 所以这里要比合并组，不能比 id。比 id 会把唯一真实的用例挡在外面。
+            entity = await session.get(Entity, old.subject_id)
+            if entity is None:
+                # 外键是 CASCADE，理论上不会发生；发生了说明数据被绕过 ORM 改过，
+                # 这时硬算分组会拿 None 去查 name 并抛 AttributeError，报错离原因很远
+                print(f"⚠ 主语实体不存在：{old.subject_id}", file=sys.stderr)
+                return 2
+            rows = list((await session.execute(select(Entity))).scalars().all())
+            group = build_entity_group(entity, rows)
+            if new.subject_id not in group.ids:
+                print(
+                    f"两条事实挂在不同的实体上（{entity.name} 与被取代那条的主语）。"
+                    "先 merge 让它们同组，再来闭合——跨实体的「取代」不是世界变了，"
+                    "是记录挂错了地方。",
+                    file=sys.stderr,
+                )
+                return 2
+
+        print(f"闭合：{old.predicate} → {old.object_text}")
+        print(f"     区间 {_span_text(old.valid_from, plan.cutoff)}")
+        if new is not None:
+            print(f"  由：{new.predicate} → {new.object_text}")
+            print(f"     区间 {_span_text(new.valid_from, new.valid_to)}")
+        print(f"  理由：{plan.reason}")
+        for warning in plan.warnings:
+            print(f"  ⚠ {warning}", file=sys.stderr)
+
+        if plan.noop:
+            print("已经是这个闭合日，不用改。", file=sys.stderr)
+            return 0
+
+        assert plan.cutoff is not None
+        if not args.dry_run:
+            old.valid_to = plan.cutoff
+            old.valid_to_reason = plan.reason
+            if new is not None:
+                old.superseded_by = new.id
+        print(
+            "     → 已闭合" + ("（dry-run，未写库）" if args.dry_run else ""),
+            file=sys.stderr,
+        )
+        before = plan.cutoff - timedelta(days=1)
+        print(
+            f"验证：as_of({before.isoformat()}) 只该有旧的那条；"
+            f"as_of({plan.cutoff.isoformat()}) 只该有新的那条（右端不含当日）。",
+            file=sys.stderr,
+        )
+        return 0
+
+
+def _span_text(start: date | None, end: date | None) -> str:
+    return f"{start.isoformat() if start else '?'} → {end.isoformat() if end else '至今'}"
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(
-        description="事实审计与修复（audit 只读；retract 撤回不删除；merge 合并实体）"
+        description="事实审计与修复（audit 只读；retract 撤回不删除；merge 合并实体；"
+        "supersede 闭合区间）"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -659,11 +930,28 @@ async def main() -> int:
     merge.add_argument("--undo", action="store_true", help="解除合并，让 --id 那行恢复独立")
     merge.add_argument("--dry-run", action="store_true", help="只打印，不写库")
 
+    supersede = sub.add_parser(
+        "supersede", help="闭合一条事实的区间（补 valid_to，不撤回）"
+    )
+    supersede.add_argument("--id", default="", help="被闭合的那条（旧的）")
+    supersede.add_argument("--by", default="", help="取代它的那条（新的）")
+    supersede.add_argument(
+        "--on",
+        default="",
+        help="闭合到哪天 YYYY-MM-DD。省略时取 --by 那条的 valid_from——"
+        "「旧的不再成立」和「新的开始成立」是同一个分界，这样两条区间正好接上",
+    )
+    supersede.add_argument("--reason", default="", help="为什么在这天结束（省略时由 --by 生成）")
+    supersede.add_argument("--undo", action="store_true", help="重新打开区间（三列一起清回 NULL）")
+    supersede.add_argument("--dry-run", action="store_true", help="只打印，不写库")
+
     args = parser.parse_args()
     if args.command == "audit":
         return await run_audit(args)
     if args.command == "merge":
         return await run_merge(args)
+    if args.command == "supersede":
+        return await run_supersede(args)
     return await run_retract(args)
 
 
