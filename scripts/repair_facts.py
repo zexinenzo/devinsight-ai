@@ -807,12 +807,35 @@ def candidate_pairs(views: list[FactView]) -> list[tuple[FactView, FactView]]:
     return list(zip(ordered, ordered[1:], strict=False))
 
 
+def tie_message(old: FactView, new: FactView) -> str:
+    """两条起始日相同时的说明。返回空串表示不是这种情况。
+
+    这里要说的不是「闭合日算不出来」，而是**这一对根本没有前后任关系可言**：
+    日期相同的时候，`candidate_pairs` 是按 `object_text` 字母序排的，于是打印出来的
+    箭头方向纯属巧合——`ceo` 那组就排成了「Colette Kress → Jensen Huang」，
+    而事实方向正好相反。给一条方向错的箭头，比不给箭头更糟：人会照着它去闭合。
+
+    同时要给对药方。实跑 `--list` 的 7 对候选里 6 对是这个形态，其中
+    `released_version` 的三组（nginx 1.30.7/1.31.9、DaisyRose 的三种量化权重、
+    GPT-6.2 的 Astra/Sol）根本不是换代，是同时存在——把它们往 `--on` 上引，
+    等于教人给并存的东西编一个结束日。
+    """
+
+    if old.valid_from is None or old.valid_from != new.valid_from:
+        return ""
+    day = old.valid_from.isoformat()
+    return (
+        f"起始日都是 {day}，排不出谁是谁的前任，箭头方向不作数。两种可能："
+        "① 这两条本来就并存（谓词不是单值，加进 MULTI_VALUED_PREDICATES 后它会消失）；"
+        "② 确实是换代，但库里两条都只有发文日（用 --on 指定卸任日，别猜）。"
+    )
+
+
 def _pad(text: str, width: int) -> str:
     """按终端显示宽度补空格。中文占两列，用 len() 算会把整张表撑歪。"""
 
     used = sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
     return text + " " * max(1, width - used)
-
 
 async def run_supersede_list(args) -> int:
     """列出「同一实体、同一个单值谓词、两条以上同时开着」的候选，并直接给出命令。
@@ -852,6 +875,7 @@ async def run_supersede_list(args) -> int:
         groups.setdefault((root.id, fact.predicate), []).append(_view(fact))
 
     candidates = 0
+    closable = 0
     for (root_id, predicate), views in sorted(
         groups.items(), key=lambda item: (item[0][1], by_id[item[0][0]].name)
     ):
@@ -870,11 +894,16 @@ async def run_supersede_list(args) -> int:
             )
         for old, new in pairs:
             candidates += 1
+            tied = tie_message(old, new)
+            if tied:
+                print(f"  ⚠ {old.object_text} / {new.object_text}：{tied}")
+                continue
             plan = plan_closure(old, new, today=date.today())
             if plan.error:
                 print(f"  ⚠ {old.object_text} → {new.object_text}：{plan.error}")
                 continue
             print(f"  ✓ 可闭合在 {plan.cutoff.isoformat()}（{plan.reason}）")
+            closable += 1
             print(
                 "      .venv/bin/python scripts/repair_facts.py supersede "
                 f"--id {old.id} --by {new.id} --dry-run"
@@ -883,7 +912,11 @@ async def run_supersede_list(args) -> int:
     if candidates == 0:
         print("没有候选：单值谓词上没有同时开着两条的实体。")
         return 0
-    print(f"\n共 {candidates} 对候选。上面每条 ✓ 的命令先加 --dry-run 跑一遍。")
+    print(
+        f"\n共 {candidates} 对候选，其中 {closable} 对能闭合。"
+        "⚠ 的是「判断不了」，不是「工具坏了」——它们要么本来就并存，"
+        "要么缺一个真实的交接日。"
+    )
     return 0
 
 

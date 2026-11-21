@@ -369,3 +369,25 @@ def test_pad_counts_cjk_as_two_columns() -> None:
     """表格对齐靠显示宽度，不靠字符个数；否则中文名那一列整体右移。"""
     assert repair._pad("英伟达", 8) == "英伟达  "
     assert repair._pad("Nvidia", 8) == "Nvidia  "
+
+
+def test_same_start_date_pair_gets_no_direction() -> None:
+    """起始日相同时不给箭头。`--list` 按 object_text 字母序排，方向纯属巧合。
+
+    实跑那 7 对候选时，`ceo` 那组排成了「Colette Kress → Jensen Huang」——
+    而真实方向正好相反。一条方向错的箭头比没有箭头更糟：人会照着它闭合。
+    """
+    old = fact(object_text="Colette Kress", start=date(2026, 11, 18))
+    new = fact(object_text="Jensen Huang", start=date(2026, 11, 18))
+    message = repair.tie_message(old, new)
+    assert message
+    assert "不作数" in message
+    # 药方要同时给两条：谓词本来是并存的，或者缺真实的交接日
+    assert "MULTI_VALUED_PREDICATES" in message and "--on" in message
+
+
+def test_different_start_dates_are_not_treated_as_tied() -> None:
+    """日期不同时不能误判成「排不出前后任」，否则真正可闭合的那对会被挡掉。"""
+    old = fact(start=date(2026, 11, 18))
+    new = fact(object_text="Jensen Huang", start=date(2026, 11, 20))
+    assert repair.tie_message(old, new) == ""

@@ -100,9 +100,12 @@ def test_same_object_reported_twice_is_not_a_conflict():
 
 
 def test_open_ended_period_overlaps_anything_later():
-    left = entry("released_version", "GPT-5", date(2026, 8, 7), None)
-    right = entry("released_version", "GPT-6", date(2027, 1, 1), None)
-    # 两条都没有 valid_to，说明都被当成「至今仍是当前版本」——这本身就是冲突
+    # 用单值谓词测，理由同上一条：`released_version` 已归入多值谓词，整组会被跳过，
+    # 这条断言就会在「跳过」那一支上变成 0 == 1 而失败——失败是好结果，
+    # 更糟的是当初它用 `released` 时曾经静默通过（见上一条注释）。
+    left = entry("ceo", "Sam Altman", date(2026, 8, 7), None)
+    right = entry("ceo", "Emmett Shear", date(2027, 1, 1), None)
+    # 两条都没有 valid_to，说明都被当成「至今仍在任」——这本身就是冲突
     assert len(find_overlaps([left, right])) == 1
 
 
@@ -147,3 +150,19 @@ def test_multi_valued_names_all_exist_in_predicate_table():
 
 def test_single_entry_never_conflicts():
     assert find_overlaps([entry("ceo", "Sam Altman", date(2023, 1, 1), None)]) == []
+
+
+def test_released_version_is_multi_valued():
+    """一个项目同时维护多条版本线，两条都成立。
+
+    这条来自 `supersede --list` 的实跑输出：nginx 1.30.7 与 1.31.9 被当成前后任
+    报了出来，DaisyRose 的 BF16/FP8/NVFP4 三种权重、GPT-6.2 的 Astra/Sol 同样。
+    它们不是换代，是同时存在——1.30 是稳定线、1.31 是主线，两条线并行发布。
+    名单里漏掉 `released_version` 的代价是这三组各报一条假冲突，而真冲突会被埋。
+    """
+
+    entries = [
+        entry("released_version", "1.30.7", date(2026, 11, 18), None),
+        entry("released_version", "1.31.9", date(2026, 11, 18), None),
+    ]
+    assert find_overlaps(entries) == []

@@ -62,6 +62,10 @@ PREDICATES: dict[str, str] = {
 MULTI_VALUED_PREDICATES: frozenset[str] = frozenset(
     {
         "released",  # 可以发布多个产品
+        # 一个项目同时有多个在维护的版本线：nginx 1.30.7（stable）与 1.31.9（mainline）
+        # 并行发布，两条都成立。同一模型的多种量化权重（BF16 / FP8 / NVFP4）、
+        # 同一系列的多个变体（Astra / Sol）同理——它们不是前后任，是同时存在。
+        "released_version",
         "announced",  # 可以宣布多件事
         "discontinued",  # 可以下线多个功能或产品线
         "acquired",  # 可以收购多家公司
