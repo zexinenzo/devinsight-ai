@@ -954,10 +954,17 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 ### 闭合：时间轴的右半边
 
 ```bash
+.venv/bin/python scripts/repair_facts.py supersede --list                     # 谁该被闭合（只读）
 .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新> --dry-run
 .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新>
 .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新> --undo
 ```
+
+`--list` 不是方便，是必须：`--id` 与 `--by` 抄反了**不会报错**——两条记录都合法，
+脚本照样打印「已闭合」，只在某个历史时点让 `as_of` 答错一天。候选对因此由脚本算：
+按合并组聚合（合并只写指针，`英伟达`/`Nvidia` 那对 CEO 仍挂在两个 id 上）、只取单值
+谓词（`partnered_with` 六条会产出 15 条假候选）、只配相邻两条（三条依次在任要闭合
+`(A,B)` 与 `(B,C)`，拿 A 对 C 会让中间那段任期消失）。
 
 `valid_to` 从建表起就在表里、触发器也一直允许改，**但没有任何写入方**——于是每条事实都是
 「至今成立」。补齐它的时候要一起补齐「为什么在这天结束」：迁移 0013 加了 `valid_to_reason`
