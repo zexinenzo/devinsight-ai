@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -56,6 +57,27 @@ def test_license_variants_are_recognized() -> None:
 def test_product_names_that_merely_start_with_a_license_name_are_not_flagged() -> None:
     """`Apache Spark` 是产品，`Apache-2.0` 是许可证。正则必须整串匹配。"""
     for text in ("Apache Spark", "MIT Media Lab", "BSD 套接字"):
+        assert repair.is_shape_violation(text) is None, text
+
+
+def test_license_followed_by_a_qualifier_is_still_a_violation() -> None:
+    """钉住 `$` 那个坑。
+
+    `LICENSE_RE` 原来锚定结尾，于是 `AGPL-3.0 单二进制` 逃过 ① 档，
+    和已经撤回的 `Windshift --> AGPL-3.0` 是同一个错误，只因为多了三个字。
+    放宽的是**尾部**，不是**首部**——首部一旦放宽，`MIT Media Lab` 就会被误撤。
+    """
+    for text in ("AGPL-3.0 单二进制", "Apache-2.0 许可证", "MIT license", "GPLv3 源码"):
+        assert repair.is_shape_violation(text) == "object_is_license", text
+
+
+def test_qualifier_whitelist_is_not_a_length_rule() -> None:
+    """白名单不是「尾巴短就算」。
+
+    按长度放宽会让 `MIT License Manager` 这种产品名被自动撤回，而 ① 档是
+    唯一会自动执行的档位，误撤没有第二双眼睛拦得住。
+    """
+    for text in ("MIT License Manager", "Apache Airflow", "GPL 兼容的运行时"):
         assert repair.is_shape_violation(text) is None, text
 
 
@@ -232,3 +254,63 @@ def test_summary_counts_each_tier() -> None:
     assert "① 形状不符（可自动撤回）：1" in text
     assert "② 宾语形状可疑（人工队列）：1" in text
     assert "③ 证据与谓词冲突（人工队列）：1" in text
+
+
+# --- retract 的参数防线 ---------------------------------------------------
+
+
+def _retract_args(**overrides) -> Namespace:
+    options = {
+        "ids": ["7beeb987-93d1-4773-8651-3b2c811c7e30"],
+        "reason": "宾语是许可证，原文写的是「Open source · Apache-2.0」",
+        "replaced_by": "",
+        "undo": False,
+        "dry_run": True,
+    }
+    options.update(overrides)
+    return Namespace(**options)
+
+
+def test_retract_requires_a_reason() -> None:
+    """数据库的 CHECK 只要求「不是 NULL」，空字符串能过——所以这条必须挡在应用层。
+
+    没有理由的撤回是一次不可审计的判断，和当初模型编造事实是同一种病。
+    """
+    plan = repair.parse_retract_args(_retract_args(reason=""))
+    assert plan.error
+    assert "必须给理由" in plan.error
+
+
+def test_retract_rejects_whitespace_only_reason() -> None:
+    plan = repair.parse_retract_args(_retract_args(reason="   \t "))
+    assert plan.error
+
+
+def test_undo_does_not_need_a_reason() -> None:
+    """恢复采信不是判断，只是把三列置回 NULL，不需要举证。"""
+    plan = repair.parse_retract_args(_retract_args(reason="", undo=True))
+    assert plan.error == ""
+
+
+def test_retract_parses_multiple_ids() -> None:
+    first = "7beeb987-93d1-4773-8651-3b2c811c7e30"
+    second = "1420dc3c-e9e2-484b-adce-eee36aac8fb6"
+    plan = repair.parse_retract_args(_retract_args(ids=[first, second]))
+    assert [str(item) for item in plan.ids] == [first, second]
+
+
+def test_retract_trims_reason() -> None:
+    plan = repair.parse_retract_args(_retract_args(reason="  宾语是许可证  "))
+    assert plan.reason == "宾语是许可证"
+
+
+def test_retract_rejects_bad_uuid() -> None:
+    plan = repair.parse_retract_args(_retract_args(ids=["not-a-uuid"]))
+    assert plan.error
+    assert "UUID" in plan.error
+
+
+def test_retract_rejects_bad_replaced_by() -> None:
+    plan = repair.parse_retract_args(_retract_args(replaced_by="nope"))
+    assert plan.error
+    assert "replaced-by" in plan.error

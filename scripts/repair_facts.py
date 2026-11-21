@@ -1,16 +1,22 @@
-"""阶段 8：事实审计——只读，不写库。
+"""阶段 8：事实审计与撤回。
 
-    .venv/bin/python scripts/repair_facts.py audit                      # 人看的表格
-    .venv/bin/python scripts/repair_facts.py audit --format csv          # 给 Excel 的 CSV
+    .venv/bin/python scripts/repair_facts.py audit                       # 只读，人看的表格
     .venv/bin/python scripts/repair_facts.py audit --format csv --out .tmp/audit.csv
+    .venv/bin/python scripts/repair_facts.py retract --id <uuid> --reason "…（附原文）"
+    .venv/bin/python scripts/repair_facts.py retract --id <uuid> --undo   # 恢复采信
 
-**这个脚本为什么不写库。** 判定与执行必须分开，否则就成了「让模型给自己判卷」——
-判定结果一旦能直接落库，就没有第二双眼睛看过它。撤回动作留给
-`repair_facts.py retract --id ... --reason ...`（下一步实现），中间这一步是人。
+**`audit` 为什么只读。** 判定与执行必须分开，否则就成了「让模型给自己判卷」——
+判定结果一旦能直接落库，就没有第二双眼睛看过它。中间那一步是人。
 
-三档判定见 `docs/阶段8-数据修复设计.md` 第 5 节。核心事实是：238 条里能自动判定的只有
-2 条，不到 1%。所以这个脚本的产出不是「一份待删清单」，而是**一份按可疑程度排好序的
-人工队列**——它的价值在于把 238 条缩到十几条，不在于替你决定。
+**`retract` 为什么是撤回不是删除。** 见 `docs/阶段8-数据修复设计.md` 第 3 节：
+行没了，证据链跟着没了，时间线少一条的表现是「这件事没发生」而不是「这里有个洞」。
+所以只填 `retracted_at` 三列，恢复就是把它们置回 NULL——这条可逆性由 `--undo` 直接兑现。
+撤回必须附理由（数据库有 CHECK），理由里最好带原文：没有依据的撤回本身
+就是一次不可审计的判断，和当初模型编造事实是同一种病。
+
+三档判定见设计稿第 5 节。核心事实是：270 条里能自动判定的只有 2 条，不到 1%。所以
+`audit` 的产出不是「一份待删清单」，而是**一份按可疑程度排好序的人工队列**——
+它的价值在于把 270 条缩到十几条，不在于替你决定。
 
 三档的区别不在难度，在判据来源：
 
@@ -35,6 +41,7 @@ import asyncio
 import csv
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,15 +52,27 @@ sys.path.insert(0, str(API_DIR))
 from app.db.models import Entity, FactClaim
 from app.db.session import session_scope
 from app.services.timeline_service import DATE_SOURCE_LABELS, PREDICATES
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 # ① 形状：许可证标识符。没有任何谓词把许可证声明为合法宾语——
 # 许可证是「以什么条件开源」，是条件不是产物。
 # 注意这里不豁免 open_sourced：豁免它，恰好会放过唯一真实的违规
 # （`Fardesk --open_sourced--> Apache-2.0`），而那句证据里本来就写了许可证。
+# 匹配许可证**开头**，不锚定结尾：宾语里常跟着一小段限定语
+# （`AGPL-3.0 单二进制`、`Apache-2.0 许可证`），锚死了就会把它们全放过。
+# 实例：`Windshift --open_sourced--> AGPL-3.0 单二进制` 在锚定的写法下逃过了 ① 档，
+# 和已经撤回的 `Windshift --> AGPL-3.0` 是同一个错误，只因为多了三个字。
 LICENSE_RE = re.compile(
     r"^(?:Apache|MIT|BSD|GPL|AGPL|LGPL|MPL|EPL|ISC|Unlicense|CC[- ]BY)"
-    r"[- ]?\d?(?:\.\d)?(?:[- ]only|[- ]or[- ]later)?$",
+    r"[- ]?v?\d?(?:\.\d+)?(?:[- ]only|[- ]or[- ]later)?",
+    re.IGNORECASE,
+)
+# 许可证后面允许跟的限定语白名单。用白名单而不是「长度很短就算」：
+# 一旦按长度放宽，`MIT License Manager` 这种产品名就会被误撤，
+# 而 ① 档是唯一会自动执行的档位，误撤没有第二双眼睛拦得住。
+LICENSE_TAIL_RE = re.compile(
+    r"^(?:[ \t]*(?:license|licence|许可证|协议|授权|条款|版本|"
+    r"单|二进制|binary|only|开源|代码|源码|组件|repo|repository))*$",
     re.IGNORECASE,
 )
 
@@ -109,7 +128,9 @@ def is_shape_violation(object_text: str) -> str | None:
     刻意不接 `predicate` 参数：一旦按谓词分支，它就变成判断题了，而 ① 档
     唯一的正当性就是「这个位置不能放这种东西」，与谓词无关。
     """
-    if LICENSE_RE.match(object_text.strip()):
+    text = object_text.strip()
+    match = LICENSE_RE.match(text)
+    if match and LICENSE_TAIL_RE.match(text[match.end() :]):
         return "object_is_license"
     return None
 
@@ -332,20 +353,7 @@ def summarize(rows: list[AuditRow]) -> str:
     return text
 
 
-async def main() -> int:
-    parser = argparse.ArgumentParser(description="事实审计与修复（当前只有只读的 audit）")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    audit = sub.add_parser("audit", help="只读扫描，输出可疑事实队列")
-    audit.add_argument("--format", choices=("table", "csv"), default="table")
-    audit.add_argument("--out", default="", help="写到文件（CSV 默认输出到 stdout）")
-    audit.add_argument("--limit", type=int, default=0, help="只扫描前 N 条事实，0 表示全部")
-
-    args = parser.parse_args()
-
-    if args.command != "audit":
-        parser.error(f"未知命令 {args.command}")
-
+async def run_audit(args) -> int:
     async with session_scope() as session:
         rows = await fetch_rows(session, args.limit or None)
 
@@ -362,11 +370,160 @@ async def main() -> int:
     # 统计走 stderr：CSV 模式要保证 stdout 是干净的表格数据，能直接重定向
     print(summarize(rows), file=sys.stderr)
     print(
-        "本脚本不写库。① 档也只报告——撤回要单独执行，并且必须附理由；"
+        "audit 不写库。① 档也只报告——撤回要单独执行 retract，且必须附理由；"
         "②③ 档请对着 evidence 过一遍原文再决定。",
         file=sys.stderr,
     )
     return 0
+
+
+@dataclass(slots=True)
+class RetractPlan:
+    """`retract` 的参数在碰数据库之前就该验完。
+
+    单独拆出来是为了它能被测试：真正的写库路径要连数据库，而「没给理由就拒」
+    恰恰是最不能靠手工试的一条——它是这道防线的全部。
+    """
+
+    ids: list[uuid.UUID]
+    replaced_by: uuid.UUID | None
+    reason: str
+    error: str = ""
+
+
+def parse_retract_args(args) -> RetractPlan:
+    reason = (args.reason or "").strip()
+    if not args.undo and not reason:
+        return RetractPlan(
+            ids=[],
+            replaced_by=None,
+            reason="",
+            error=(
+                "撤回必须给理由。--reason 写清楚依据，最好把原文那句贴进来——"
+                "没有理由的撤回是一次不可审计的判断，和当初模型编造事实是同一种病。"
+            ),
+        )
+
+    try:
+        ids = [uuid.UUID(item) for item in args.ids]
+    except ValueError as exc:
+        return RetractPlan(ids=[], replaced_by=None, reason=reason, error=f"id 不是合法 UUID：{exc}")
+
+    replaced_by = None
+    if args.replaced_by:
+        try:
+            replaced_by = uuid.UUID(args.replaced_by)
+        except ValueError as exc:
+            return RetractPlan(
+                ids=ids,
+                replaced_by=None,
+                reason=reason,
+                error=f"--replaced-by 不是合法 UUID：{exc}",
+            )
+
+    return RetractPlan(ids=ids, replaced_by=replaced_by, reason=reason)
+
+
+async def run_retract(args) -> int:
+    """撤回，不删除。
+
+    **不删除的理由在判错，不在洁癖**：行没了，证据链跟着没了，时间线少一条的表现是
+    「这件事没发生」，而不是「这里有个洞」。判错的概率乘以批量，就是几十条真实信息
+    被抹掉且无人知道少了什么。所以这里只填 `retracted_at` 三列，恢复就是把它们置回 NULL。
+    """
+    plan = parse_retract_args(args)
+    if plan.error:
+        print(plan.error, file=sys.stderr)
+        return 2
+
+    ids = plan.ids
+    replaced_by = plan.replaced_by
+    reason = plan.reason
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(FactClaim, Entity.name)
+                .join(Entity, Entity.id == FactClaim.subject_id)
+                .where(FactClaim.id.in_(ids))
+            )
+        ).all()
+        found = {fact.id: (fact, subject) for fact, subject in rows}
+
+        if replaced_by is not None and await session.get(FactClaim, replaced_by) is None:
+            print(f"⚠ --replaced-by 指向的事实不存在：{replaced_by}", file=sys.stderr)
+            return 2
+
+        changed = 0
+        for index, item in enumerate(ids, start=1):
+            if item not in found:
+                print(f"⚠ 库里没有这条 id：{item}", file=sys.stderr)
+                continue
+            fact, subject = found[item]
+            print(f"[{index}] {subject} --{fact.predicate}--> {fact.object_text}")
+            print(f"     id={fact.id}")
+            print(f"     证据：{(fact.evidence_text or '（模型没有提供 evidence）')[:120]}")
+
+            if args.undo:
+                if fact.retracted_at is None:
+                    print("     当前是采信状态，跳过")
+                    continue
+                if not args.dry_run:
+                    fact.retracted_at = None
+                    fact.retracted_reason = None
+                    fact.retracted_replaced_by = None
+                changed += 1
+                print("     → 已恢复采信" + ("（dry-run，未写库）" if args.dry_run else ""))
+                continue
+
+            if fact.retracted_at is not None:
+                print(f"     已撤回（{fact.retracted_reason}），跳过")
+                continue
+
+            if not args.dry_run:
+                fact.retracted_at = func.now()
+                fact.retracted_reason = reason
+                if replaced_by is not None:
+                    fact.retracted_replaced_by = replaced_by
+            changed += 1
+            print("     → 已撤回" + ("（dry-run，未写库）" if args.dry_run else ""))
+
+    verb = "恢复" if args.undo else "撤回"
+    print(f"{verb} {changed} 条。", file=sys.stderr)
+    if not args.undo and not args.dry_run and changed:
+        print(
+            "验证方式：撤回一条 CEO 后，`as_of(那天)` 的回答不能变——"
+            "变了对，说明 valid_to 与 retracted_at 被混用了。",
+            file=sys.stderr,
+        )
+    return 0
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser(description="事实审计与修复（audit 只读；retract 撤回不删除）")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    audit = sub.add_parser("audit", help="只读扫描，输出可疑事实队列")
+    audit.add_argument("--format", choices=("table", "csv"), default="table")
+    audit.add_argument("--out", default="", help="写到文件（CSV 默认输出到 stdout）")
+    audit.add_argument("--limit", type=int, default=0, help="只扫描前 N 条事实，0 表示全部")
+
+    retract = sub.add_parser("retract", help="撤回一条或多条事实（不删除，必须附理由）")
+    retract.add_argument("--id", dest="ids", nargs="+", required=True, help="一条或多条事实 id")
+    retract.add_argument("--reason", default="", help="为什么撤：依据是什么，最好附原文")
+    retract.add_argument(
+        "--replaced-by",
+        dest="replaced_by",
+        default="",
+        help="被哪条新事实替代（只在能确定对应关系时填，定不准就留空）",
+    )
+    retract.add_argument("--undo", action="store_true", help="恢复采信（把三列清回 NULL）")
+    retract.add_argument("--dry-run", action="store_true", help="只打印，不写库")
+
+    args = parser.parse_args()
+    if args.command == "audit":
+        return await run_audit(args)
+    return await run_retract(args)
 
 
 if __name__ == "__main__":
