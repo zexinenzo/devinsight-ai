@@ -320,9 +320,21 @@ class FactClaim(Base):
     闭合。`valid_to IS NULL` 表示「至今仍成立」。
 
     这条纪律由数据库触发器 `trg_fact_claims_no_rewrite` 强制（见迁移 0009）：
-    允许的 UPDATE 只有闭合 `valid_to` 和指向 `superseded_by`，改 `object_text` /
-    `predicate` / `valid_from` / `subject_id` / `document_id` 会直接抛异常。
+    允许的 UPDATE 只有闭合 `valid_to`、指向 `superseded_by`、以及撤回（迁移 0010 加的
+    三列）；改 `object_text` / `predicate` / `valid_from` / `subject_id` /
+    `document_id` / `recorded_at` 会直接抛异常。
     ORM 层面看不出来，所以写在这里免得有人以为是普通可改字段。
+
+    **表里有三个「这条记录不再有效」的字段，语义各不相同，填错会让 `as_of` 撒谎**：
+
+    | 字段 | 轴 | 含义 |
+    |---|---|---|
+    | `valid_to` | 世界 | 这件事在现实中什么时候不再成立 |
+    | `superseded_by` | 世界 | 被哪条新事实取代（因为世界变了） |
+    | `retracted_at` | 认识 | 我们什么时候不再声称这条记录（因为它是错的） |
+
+    撤回不删除，是因为判错无法挽回：行没了，证据链就没了，时间线少一条的表现是
+    「这件事没发生」，而不是「这里有个待修的洞」。见 `docs/阶段8-数据修复设计.md`。
 
     `valid_from_source` 记录日期是怎么来的：`stated` 文中明说、`published` 用发文
     时间兜底、`unknown` 无从得知。时间线上「11 月 18 日」看起来一样硬，但一个是
@@ -339,13 +351,22 @@ class FactClaim(Base):
             "document_id",
             name="uq_fact_claims_identity",
         ),
+        # 注意命名约定（app/db/base.py）会补上 `ck_<表名>_` 前缀，所以这里只写后缀。
+        # 写成全名 `ck_fact_claims_period` 会得到 `ck_fact_claims_ck_fact_claims_period`，
+        # 与迁移 0009 里建出来的名字对不上——元数据与真库不一致，autogenerate 会想重建。
         CheckConstraint(
             "valid_to IS NULL OR valid_from IS NULL OR valid_to > valid_from",
-            name="ck_fact_claims_period",
+            name="period",
         ),
         CheckConstraint(
             "valid_from_source IN ('stated', 'published', 'unknown')",
-            name="ck_fact_claims_from_source",
+            name="from_source",
+        ),
+        # 撤回必须给理由：没有理由的撤回是一次不可审计的判断，
+        # 而「不可审计」正是当初模型编造事实的同类问题
+        CheckConstraint(
+            "retracted_at IS NULL OR retracted_reason IS NOT NULL",
+            name="retraction",
         ),
         # 主查询是「某实体时间线按时间倒序」，联合索引让排序不必再走 sort
         Index("ix_fact_claims_subject_valid", "subject_id", text("valid_from DESC")),
@@ -381,5 +402,14 @@ class FactClaim(Base):
     confidence: Mapped[float | None] = mapped_column(Float)
     # 指向取代它的那条。保留指针而不是删除旧行，才能解释「这条为什么失效了」
     superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fact_claims.id", ondelete="SET NULL")
+    )
+    # 撤回（迁移 0010）：**认识轴**，不是世界轴。NULL 表示「仍然采信这条记录」。
+    # 撤回后行与证据都留着，恢复只需把两列置回 NULL——这是选撤回而不是 DELETE 的理由。
+    retracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retracted_reason: Mapped[str | None] = mapped_column(Text)
+    # 撤回后被哪条替代（同一文档 + 同一主语 + 同一谓词才能确定，定不准就留空）。
+    # 刻意不与上面的 `superseded_by` 共名：那个是世界轴，这个属于认识轴
+    retracted_replaced_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("fact_claims.id", ondelete="SET NULL")
     )
