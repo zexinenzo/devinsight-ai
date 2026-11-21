@@ -4,12 +4,26 @@
 - Firebase 是 HN 官方数据源，字段口径与站点一致；Algolia 是第三方检索镜像，
   元数据有延迟，且排序规则与站点榜单不完全等价。
 - 代价是 N+1 请求（先取 id 列表，再逐条取详情），所以这里用信号量限制在途并发，
-  并按 item id 做增量，避免每轮把整个榜单重拉一遍。
+  并按「已见 id 集合」做增量，避免每轮把整个榜单重拉一遍。
 
-增量策略：
-- HN 的 item id 全局单调递增，新故事一定拿到更大的 id；
-- 游标只需记 max_item_id，下一轮只处理 id 更大的条目；
-- 候选按 id 升序处理，超出 max_items 的部分留到下一轮，保证不跳条目不漏条目。
+榜单选择（为什么是 topstories 而不是 newstories）：
+- `newstories` 是「按发布先后」的流水，那一刻每条故事的 `score` 恒为 1。
+  从它抓，等于「按时间全收」——库里 68% 的条目没有任何可抽取事实，
+  很大一部分就是这么进来的（Show HN 的冷门小工具、个人随笔）。
+- `topstories` 是按 score 排好的榜（500 条），榜单序本身就是热度信号。
+  抓到的那一刻 score 已经是真实值，不需要等回访才知道哪条值得要。
+- 代价必须说清：这是一份**滚动快照**，不是全集。从没进过前 500 的故事永远
+  不会被看到；同步间隔越长，短暂上榜又快速回落的故事漏得越多。目前的
+  `poll_interval_minutes=30` 与榜单轮换速度大致匹配，再稀就会明显漏。
+
+增量策略（为什么不能再用 max_item_id）：
+- 单调游标能成立的前提是「id 越大越新」，而榜单的 id 是**乱序**的：
+  三天前发布的老帖今天可能重新回榜，id 比游标小得多。沿用 `id > 游标`
+  会把它当成过期货直接过滤掉——而那恰恰是「按热度」最该抓的东西。
+- 所以游标改成一份 `seen_ids` 集合：只抓「榜上有、但这份集合里没有」的条目，
+  id 大小与是否见过无关。集合会随轮次增长，截断到最近 SEEN_IDS_LIMIT 个。
+- 截断的后果是「掉出榜很久又回来」的条目会被重新请求一次，由
+  `(source_id, external_id)` 唯一约束挡掉——多一次请求，不会产生重复行。
 
 限流：
 - Firebase 对普通读取没有硬性配额，但逐条请求容易形成突发流量，
@@ -19,7 +33,10 @@
 失败取舍：
 - 单条 item 返回 null 是该条目已被删除，由过滤规则自然跳过；
 - 单条详情请求失败只记 warning 并跳过，不阻断整批。原因是 HN 条目随时可能
-  被删或 404，重试没有意义；而游标一旦因此卡住，会让后续所有新条目都进不来。
+  被删或 404，重试没有意义。
+- 失败的条目也计入 seen：它已经消耗掉本轮的请求预算，不计入只会让下一轮
+  再为一个死条目白试一次。代价是偶发的网络抖动会造成一次漏抓——这里选
+  「漏一条」，不选「一堆死条目每轮重试、把 200 个名额慢慢堵满」。
   唯一约束保证了即便重复抓取也不会产生脏数据。
 """
 
@@ -42,11 +59,36 @@ from app.utils.urls import canonicalize_url
 
 logger = get_logger(__name__)
 
-STORY_LIST_PATH = "newstories.json"
+STORY_LIST_PATH = "topstories.json"
 ITEM_PATH = "item/{item_id}.json"
 ITEM_PAGE_TEMPLATE = "https://news.ycombinator.com/item?id={item_id}"
 # Firebase 没有公布配额，这个数字是按"不制造突发流量"的经验值定的，不是官方限制
 MAX_CONCURRENCY = 8
+# seen_ids 的上限。榜单本身 500 条，留一倍余量给「已掉榜但短期内可能回榜」的条目。
+# 按每个 id 约 7 字节算，1000 条约 7KB，存 JSONB 没有压力；不截断则会无限增长。
+SEEN_IDS_LIMIT = 1000
+
+
+def _parse_cursor(cursor: Any) -> tuple[list[int], int | None]:
+    """把游标拆成 (已见 id 集合, 旧版 max_item_id)。
+
+    两种格式要并存一段时间：改榜单那天之前入库的来源，`sync_cursor` 里只有
+    `{"max_item_id": N}`。如果直接当作「没有游标」，第一次同步会把榜上 200 条
+    全部重抓一遍——不算错（唯一约束挡得住），但白花 200 次请求。这里把它读成
+    「id ≤ N 的都见过」，迁移轮只补新上榜的，下一轮写回 seen_ids 后就换代完成。
+    """
+
+    if not isinstance(cursor, dict):
+        return [], None
+
+    raw_seen = cursor.get("seen_ids")
+    seen = [item for item in raw_seen if isinstance(item, int)] if isinstance(raw_seen, list) else []
+
+    raw_legacy = cursor.get("max_item_id")
+    legacy = raw_legacy if isinstance(raw_legacy, int) else None
+
+    # 两者同时存在时以 seen_ids 为准：它信息更全，legacy 只是过渡期的拐杖
+    return (seen, None) if seen else ([], legacy)
 
 
 class HackerNewsConnector(BaseConnector):
@@ -124,8 +166,9 @@ class HackerNewsConnector(BaseConnector):
 
         # 热度信号来自 item 详情本身，不需要额外请求：
         # score 是投票数，descendants 是整棵评论树的条数。
-        # 注意这两个值在故事刚发布时都是 1 / 0，要等一阵才涨上来——
-        # 所以这里记的是「采集此刻」的值，后续要靠回访刷新，不能指望一次到位。
+        # 从榜单抓到的条目已经过一轮投票筛选，这里记的就是「上榜此刻」的分数；
+        # 但分数会随时间衰减（两天后从 400 掉到 200 是常态），所以回访任务仍然
+        # 负责保留历史最高值，见 content_service._merge_engagement。
         engagement: dict[str, Any] = {}
         if isinstance(item.get("score"), int):
             engagement["score"] = item["score"]
@@ -160,11 +203,7 @@ class HackerNewsConnector(BaseConnector):
     async def fetch(self, cursor: dict[str, Any] | None = None) -> FetchOutcome:
         started = time.perf_counter()
         active_cursor = cursor if cursor is not None else self.spec.cursor
-        last_max_id = None
-        if isinstance(active_cursor, dict):
-            raw_last = active_cursor.get("max_item_id")
-            if isinstance(raw_last, int):
-                last_max_id = raw_last
+        seen_ids, legacy_max_id = _parse_cursor(active_cursor)
 
         own_client = self._client is None
         client = self._client or httpx.AsyncClient(
@@ -182,7 +221,7 @@ class HackerNewsConnector(BaseConnector):
                 )
 
             story_ids = [item for item in story_ids if isinstance(item, int)]
-            batch, next_max_id = self._select_batch(story_ids, last_max_id)
+            batch, next_cursor = self._select_batch(story_ids, seen_ids, legacy_max_id)
 
             semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -229,27 +268,41 @@ class HackerNewsConnector(BaseConnector):
             documents=documents,
             http_status=200,
             latency_ms=latency_ms,
-            next_cursor={"max_item_id": next_max_id} if next_max_id else None,
+            next_cursor=next_cursor,
         )
 
-    def _select_batch(self, story_ids: list[int], last_max_id: int | None) -> tuple[list[int], int | None]:
-        """挑出本轮要处理的 id，并给出下一轮的游标。
+    def _select_batch(
+        self,
+        story_ids: list[int],
+        seen_ids: list[int],
+        legacy_max_id: int | None = None,
+    ) -> tuple[list[int], dict[str, Any] | None]:
+        """从榜单里挑出没见过的那批，并给出下一轮的游标。
 
-        首次运行：取榜单最新的 max_items 条作为基线。
-        之后：只取 id 大于游标的条目，按 id 升序处理，超出部分留给下一轮 ——
-        这样即便某轮只处理了一部分，游标也不会跳过没处理的条目。
+        榜单本身已按热度降序，所以「保留榜单顺序」等于「按热度优先」——
+        超出 max_items 而被截掉的永远是榜尾，而不是「id 最大」的那几条。
+        这正是旧实现（按 id 升序）做不到的：它会把昨天的高分老帖排在今天
+        刚上榜的低分新帖后面。
+
+        没有新条目时返回上一轮的 seen_ids，而不是 None。None 会被采集层理解成
+        「游标不动」，虽然结果一样，但显式返回能让「这轮看过榜单、确实没有新的」
+        和「这轮没跑」在库里有区别。
         """
 
         if not story_ids:
-            return [], last_max_id
+            # 榜单为空是上游异常，不覆盖已有游标——否则一次空响应就把历史清空
+            return [], ({"seen_ids": seen_ids} if seen_ids else None)
 
-        if last_max_id is None:
-            batch = story_ids[: self.spec.max_items]
-            return batch, max(story_ids)
-
-        candidates = sorted(item for item in story_ids if item > last_max_id)
-        if not candidates:
-            return [], last_max_id
-
+        seen = set(seen_ids)
+        candidates = [
+            item_id
+            for item_id in story_ids
+            if item_id not in seen and (legacy_max_id is None or item_id > legacy_max_id)
+        ]
         batch = candidates[: self.spec.max_items]
-        return batch, max(batch)
+
+        # 只把本轮真去请求过的计入 seen。被 max_items 截掉的下轮还会再出现，
+        # 它们没有「处理过」，不该被记成已见。
+        merged = seen_ids + batch
+        deduped = list(dict.fromkeys(merged))[-SEEN_IDS_LIMIT:]
+        return batch, {"seen_ids": deduped}

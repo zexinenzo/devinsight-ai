@@ -195,7 +195,7 @@ apps/web/            Next.js 前端（/intelligence 情报流 + 类型/来源/�
 | 来源类型 | 实现 | 增量依据 | 配额 |
 |---|---|---|---|
 | RSS / Atom | `connectors/rss.py` | 无（靠 `UNIQUE(source_id, external_id)` 去重） | 无硬限制 |
-| Hacker News | `connectors/hackernews.py` | `max_item_id`，候选按 id **升序**处理 | 无公布配额 |
+| Hacker News | `connectors/hackernews.py` | `seen_ids` 集合（榜上未见才抓），截断按**榜单序（热度）** | 无公布配额 |
 | GitHub Release | `connectors/github_releases.py` | `release_id` + ETag 条件请求 | 匿名 60 次/小时，认证 5000 次/小时 |
 | arXiv | `connectors/arxiv.py` | `latest_published` + `submittedDate` 窗口查询 | 1 请求 / 3 秒（硬限制） |
 

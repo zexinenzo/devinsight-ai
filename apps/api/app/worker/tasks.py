@@ -128,10 +128,10 @@ async def _run_refresh_engagement(within_days: int, limit: int, concurrency: int
 def refresh_hot_scores(within_days: int = 14, limit: int = 300, concurrency: int = 8) -> dict[str, int]:
     """每 6 小时回访一次热度。
 
-    HN 的 `newstories` 只返回刚发布的故事，那一刻 `score` 恒为 1。不对已入库的
-    条目做回访，「按热度抓正文」就退化成「按发布顺序抓」——所有候选在排序时
-    热度都一样低。热度只增不减（`_merge_engagement` 取历史最大），所以回访
-    不会把曾经的热帖重新判成冷门。
+    抓取已经改走 `topstories`，入库那一刻的 score 就是真实票数，不再是 1。
+    回访仍然必要，但理由变了：**分数会衰减**。一条 400 分的故事两天后掉到 200
+    是常态，而「值不值得花一次请求抓正文」看的是它曾经有多热。`_merge_engagement`
+    取历史最大值，回访只会把记录往高里修，不会把热帖重新判成冷门。
     """
 
     result = asyncio.run(_run_refresh_engagement(within_days, limit, concurrency))

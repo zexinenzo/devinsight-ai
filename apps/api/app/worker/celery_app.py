@@ -50,7 +50,7 @@ celery_app.conf.update(
             "task": "app.worker.tasks.enrich_hot_batch",
             "schedule": 1800.0,
         },
-        # 热度决定抓谁。HN 的 score 在入库那一刻恒为 1，不回访就没有排序依据
+        # 热度决定抓谁。分数会随时间衰减，回访取历史最大值作为排序依据
         "refresh-hot-scores": {
             "task": "app.worker.tasks.refresh_hot_scores",
             "schedule": 21600.0,
