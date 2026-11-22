@@ -1041,6 +1041,37 @@ CEO 仍然挂在两个 id 上。`--undo` 一次清三列（`valid_to` / `valid_t
 
 完整推导见教程第 8 章。
 
+## 环境排障：`dockerDesktopLinuxEngine` 找不到 / `ConnectionRefusedError 5432`
+
+现象一（起因）：
+
+```
+open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified
+```
+
+现象二（后果，看起来完全是另一件事）：
+
+```
+ConnectionRefusedError: [Errno 111] Connect call failed ('127.0.0.1', 5432)
+```
+
+**两者是同一件事**：Windows 上的 Docker Desktop 没在运行，所以 5432 没有进程监听。
+最常见的起因是执行过 `wsl --shutdown`——它会把 Docker 的引擎一起带走，而 Docker
+Desktop 的托盘图标可能还残留着，看着像开着。
+
+修法（顺序不能反）：
+
+1. **Windows 侧**打开 Docker Desktop（开始菜单搜 Docker），等它显示 `Engine running`。
+   只重启 WSL 终端没有用：引擎是 Windows 进程。
+2. WSL 里起容器：`docker compose up -d db`
+3. 确认：`docker compose ps` 显示 `Up (healthy)`。没到 healthy 就等几秒再看，
+   Postgres 初始化时是 `starting`。
+4. 再跑脚本。
+
+脚本现在会**先探一次库**再干活，所以第 1 步没做时会直接看到上面那段两行提示，
+而不是 120 行 SQLAlchemy + greenlet 调用栈——栈底那行才是真正的信息，而它最容易被
+终端滚掉。
+
 ## 环境排障：WSL 里 docker 报 `Exec format error`
 
 现象：`make up` 直接失败，报 `docker.exe: Exec format error`、`Error 126`。
