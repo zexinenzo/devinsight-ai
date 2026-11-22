@@ -1229,7 +1229,7 @@ async def run_recheck(args) -> int:
     if not args.link and linked:
         print(
             "确认无误后加 --link 重跑一次，把这些接替关系登记进 "
-            "`retracted_replaced_by`——只登记，不改任何事实行。"
+            "`retracted_replaced_by` 列——只登记，不改任何事实行。"
         )
     return 0
 
