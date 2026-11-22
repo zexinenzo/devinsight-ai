@@ -81,7 +81,7 @@ API_DIR = Path(__file__).resolve().parents[1] / "apps" / "api"
 sys.path.insert(0, str(API_DIR))
 
 from app.db.models import Document, Entity, FactClaim
-from app.db.session import session_scope
+from app.db.session import check_database, session_scope
 from app.services.fact_extraction import (
     ExtractedFact,
     build_prompt,
@@ -295,6 +295,13 @@ async def main() -> int:
     # 「用户没写 --limit」和「用户写了 --limit 10」。
     if args.limit is None:
         args.limit = 0 if args.only_retracted else 10
+
+    # 先探库再探模型。两个失败都是一屏栈，但库是本地的、最可能没起（Docker Desktop
+    # 没开时 5432 直接拒绝连接），所以让它在第一行说完。
+    problem = await check_database()
+    if problem:
+        print(problem, file=sys.stderr)
+        return 2
 
     try:
         client = require_llm()

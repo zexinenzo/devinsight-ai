@@ -81,7 +81,7 @@ API_DIR = SCRIPTS_DIR.parent / "apps" / "api"
 sys.path.insert(0, str(API_DIR))
 
 from app.db.models import Document, Entity, FactClaim
-from app.db.session import session_scope
+from app.db.session import check_database, session_scope
 from app.services.fact_extraction import evidence_match
 from app.services.predicate_specs import PREDICATE_SPECS
 from app.services.timeline_service import (
@@ -1300,6 +1300,14 @@ async def main() -> int:
     )
 
     args = parser.parse_args()
+
+    # 五个子命令全都要连库，所以把探测放在分发之前：让「Docker 没起」在第一行说完，
+    # 而不是等某个子命令里的 session.execute 抛出一屏 greenlet 栈。
+    problem = await check_database()
+    if problem:
+        print(problem, file=sys.stderr)
+        return 2
+
     if args.command == "audit":
         return await run_audit(args)
     if args.command == "merge":
