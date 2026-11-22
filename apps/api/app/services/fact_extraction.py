@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
-from app.services.predicate_specs import OBJECT_TYPES, SPECS
+from app.services.predicate_specs import OBJECT_TYPES, SPECS, object_shape_problem
 from app.services.timeline_service import KINDS, PREDICATES, normalize_key
 
 SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事实。
@@ -49,6 +49,7 @@ SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事�
    反例：object 写成 "在覆盖 24 个法律领域的评测中排名第一" → 这是句子不是宾语，
    榜单名写成 "法律领域评测"，名次写进 evidence（见规则 10）。
    反例：object 写成 "计划扩展，向全球 20 万研究人员免费开放" → 这是句子，不要抽。
+   反例：object 写成 "30 个库" → 数量不是产物名，这类不抽。
    object 好不好，判据是「别处报道这件事时会不会用同一个名字」："Autoform-Hard"
    会被反复提到，"面向 20 万研究人员的免费访问" 不会——那是一次公告本身，
    不是实体，只该留在 evidence 里。
@@ -63,8 +64,9 @@ SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事�
 7. 不要抽「某篇文章提到了某公司」这类事。要的是这家公司做了什么。
 8. 同一件事只抽一次，不要因为文章多处提到就重复抽取。
 9. 抽不出符合词表的事实就返回空数组 []，这是正常结果。
-10. **同一个谓词的宾语类型必须固定。** benchmark 的 object 只填评测集或榜单名
-    （"Autoform-Hard"、"法律领域评测"），分数与名次一律写进 evidence。
+10. **同一个谓词的宾语类型必须固定。** benchmark 的 object 只填评测集或基准名
+    （"Autoform-Hard"），分数与名次一律写进 evidence。**泛称的榜单**（"leaderboard"）
+    与**评审团**（"LLM judges panel"）不是基准名，这类不抽。
     反例：object="法律领域评测第一名" → 榜单名是"法律领域评测"，"第一名"是成绩，
     写进 evidence，不要写进 object。
 11. 宾语只有**泛称**时（"iPhone 版"、"partner plugins"），前面补上主语名或专名，
@@ -273,6 +275,9 @@ def to_fact(raw: dict) -> tuple[ExtractedFact | None, str]:
       报道对齐（`在覆盖 24 个法律领域的评测中排名第一` vs 下一次评测），
       时间线比对就失效了。
     - `malformed`：字段缺失，无法挽救。
+    - `object_is_*`：宾语形状与谓词声明的类型不符（`30 个库` 当产物名、
+      `leaderboard` 当基准名）。判据在 `predicate_specs.object_shape_problem`，
+      这里只调一次，不另写一份。
     """
 
     subject = str(raw.get("subject") or "").strip()
@@ -288,6 +293,10 @@ def to_fact(raw: dict) -> tuple[ExtractedFact | None, str]:
         return None, "reflexive"
     if len(object_text) > MAX_OBJECT_CHARS:
         return None, "too_long"
+
+    shape = object_shape_problem(predicate, object_text)
+    if shape:
+        return None, shape
 
     kind = str(raw.get("subject_kind") or "").strip().lower()
     if kind not in KINDS:

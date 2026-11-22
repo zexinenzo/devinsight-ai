@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -55,14 +56,14 @@ ObjectType = Literal[
 # 就成了「（宾语：产品、模型或功能名（`GPT-5`））」，读的人要数括号。
 # 举例统一用「，如」引出。
 OBJECT_TYPES: dict[ObjectType, str] = {
-    "product": "产品、模型或功能名，如 `GPT-5`、`Mode`",
+    "product": "产品、模型或功能名，如 `GPT-5`、`Mode`；**不要填数量**，如 `30 个库`",
     "version": "版本号，如 `1.31.9`、`v2.0`；同一版本的不同构建产物算同一个宾语",
     "org": "机构名，如公司、实验室、政府部门",
     "person": "人名，如 `Sam Altman`、`黄仁勋`",
     "year_or_org": "年份，如 `1993`，或机构名；**不要填创始人姓名**",
     "amount": "金额或轮次，如 `$1.2B`、`B轮`、`IPO`",
     "scale": "人数或比例，如 `1000 人`、`10%`",
-    "benchmark": "评测集或榜单名，如 `Autoform-Hard`；**分数与名次写进 evidence**",
+    "benchmark": "评测集或基准名，如 `Autoform-Hard`；**泛称榜单（`leaderboard`）与评审团不算**；分数与名次写进 evidence",
 }
 
 
@@ -122,3 +123,73 @@ PREDICATES: dict[str, str] = {spec.key: spec.label for spec in SPECS}
 MULTI_VALUED_PREDICATES: frozenset[str] = frozenset(
     spec.key for spec in SPECS if spec.multi_valued
 )
+
+
+# --- 宾语形状：抽取期拦截 ---------------------------------------------------
+#
+# 基线（`docs/数据品质基线.md`，2026-11-22）里唯一有明确对错的一类，是「宾语根本
+# 不是这个谓词该有的东西」：`released --> 30 个库`（数量当产物名）、
+# `benchmark --> leaderboard`（泛称榜单当基准名）。
+#
+# **为什么放在抽取期，而不是审计 ② 档。** `repair_facts.py` 的模块文档已经写过：
+# 「正确处理是在抽取期用 object_type 挡掉，不为它回补历史」。② 档是人工作业队列，
+# 往里塞「读起来别扭但不改变事实判断」的条目只会让队列变长、价值变低；而这两条在
+# 写入那一刻就能判，判完不写，比排队等人工更省。
+#
+# **只做机械可判的两条。** `benchmark --> Alder Lake`（CPU 代号当基准）、
+# `benchmark --> Metascore`（评分聚合站的分数）也确实错，但要判它们得靠一张品牌
+# 词表——那就是照着样本拟合，换一批数据立刻失效。这两条留在基线里，如实记着。
+
+# 数量短语：数字 + **量词** + 少量汉字，整体到底。`30 个库` 命中；
+# `2.7亿元回购专项贷款` 不命中（`亿` 不在量词表里，且后面专名超过 4 字）。
+#
+# 量词是必需的，不是可选的：允许多省一档的版本会把 `20 周年纪念版`（正常产品名）
+# 和 `2026年`（`founded` 的合法宾语）一起吞掉。
+_QUANTITY_PHRASE_RE = re.compile(
+    r"^[\d.,]+\s*(?:个|款|项|种|类|条|名|家|篇|套|本|台|张|批|组)\s*[\u4e00-\u9fa5]{0,4}$"
+)
+# 英文同义：数字 + 可数名词。`18 public datasets` 命中。
+_QUANTITY_PHRASE_EN_RE = re.compile(
+    r"^\d+\s+(?:[a-z]+\s+){0,2}"
+    r"(?:datasets|libraries|models|tools|skills|papers|repos|projects|apps|plugins)$",
+    re.IGNORECASE,
+)
+# 泛称榜单 / 评审团：**结尾**是这些词。`leaderboard`、`LLM judges panel` 命中；
+# `Multi Agent Coordination Benchmark` 不命中——它结尾是 Benchmark，那是名字。
+_GENERIC_RANKING_RE = re.compile(
+    r"(?:leaderboard|排行榜|榜单|排行|panel|评审团|评审小组|judges?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def object_shape_problem(predicate: str, object_text: str) -> str | None:
+    """抽取期形状检查：宾语与谓词声明的类型明显不符时返回原因码。
+
+    只判**不需要看原文**的两种，判据全落在宾语自身的形状上：
+
+    - `product` / `benchmark` 的宾语是数量短语（`30 个库`、`18 public datasets`）
+    - `benchmark` 的宾语是泛称榜单或评审团（`leaderboard`、`LLM judges panel`）
+
+    只对这两种 `object_type` 生效，是因为其余类型的宾语本来就可能是数字开头：
+    `version` 的 `1.30.7`、`year_or_org` 的 `2026`、`scale` 的 `1000 人`。
+    在那里按形状拦，杀掉的正是最正常的写法。
+
+    返回的原因码与 `to_fact` 其他拒绝原因同级，最后作为「宾语形状不符」计数打印——
+    被丢掉的东西要能看见，否则「模型少抽了一条」和「校验多拦了一条」长得一模一样。
+    """
+
+    spec = PREDICATE_SPECS.get(predicate)
+    if spec is None:
+        return None
+    text = object_text.strip()
+    if not text:
+        return None
+
+    if spec.object_type in {"product", "benchmark"}:
+        if _QUANTITY_PHRASE_RE.match(text) or _QUANTITY_PHRASE_EN_RE.match(text):
+            return "object_is_quantity_phrase"
+
+    if spec.object_type == "benchmark" and _GENERIC_RANKING_RE.search(text):
+        return "object_is_generic_ranking"
+
+    return None

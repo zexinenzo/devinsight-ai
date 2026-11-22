@@ -109,6 +109,7 @@ class Stats:
     rejected_predicate: int = 0
     rejected_reflexive: int = 0
     rejected_too_long: int = 0
+    rejected_object_shape: int = 0
     malformed: int = 0
     unparsed: int = 0
     unparsed_truncated: int = 0
@@ -381,6 +382,12 @@ async def main() -> int:
                         stats.rejected_reflexive += 1
                     elif reason == "too_long":
                         stats.rejected_too_long += 1
+                    elif reason.startswith("object_is_"):
+                        stats.rejected_object_shape += 1
+                        # 打印被丢掉的那一条：只计数的话，「模型没抽」和「校验拦掉」
+                        # 在日志里没有区别，而这批里恰恰可能误杀真正的产品名
+                        discarded = str(raw.get("object") or "")[:40]
+                        print(f"[{index}] x 宾语形状不符（{reason}）：{discarded}")
                     else:
                         stats.malformed += 1
                     continue
@@ -454,6 +461,7 @@ async def main() -> int:
         "\n完成：文档 {documents} 篇，抽出 {facts} 条，入库 {written} 条，"
         "重复 {duplicated} 条，谓词不合规 {rejected_predicate} 条，"
         "自反 {rejected_reflexive} 条，宾语过长 {rejected_too_long} 条，"
+        "宾语形状不符 {rejected_object_shape} 条，"
         "字段缺失 {malformed} 条，无事实 {empty_documents} 篇，"
         "重试 {retried} 篇（救回 {recovered} 篇），"
         "抽取失败 {unparsed} 篇（截断 {unparsed_truncated} / 空响应 {unparsed_empty} / "
@@ -477,6 +485,12 @@ async def main() -> int:
         print(
             "自反/宾语过长被丢弃：说明 prompt 的规则 3、4 没被遵守。"
             "比例高就换更强的模型，而不是把校验放宽——放进去的每条都会污染时间线"
+        )
+    if stats.rejected_object_shape:
+        print(
+            "宾语形状不符被丢弃：模型把数量（`30 个库`）或泛称（`leaderboard`）"
+            "当成了产物/基准名。这类信息当前词表表达不了，丢掉比落库好；"
+            "同一谓词反复出现，说明 prompt 那句宾语类型没被遵守"
         )
     if stats.evidence_missing:
         print(
