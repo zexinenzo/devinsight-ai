@@ -7,6 +7,8 @@
   python -m app.cli sync --due           # 只采集到期来源（与 Beat 逻辑一致）
   python -m app.cli sync --source 36kr_zh
   python -m app.cli docs --limit 10      # 查看最新入库情报
+  python -m app.cli timeline 英伟达       # 某实体的时间线（按谓词收拢）
+  python -m app.cli asof 英伟达 --on 2026-11-18   # 那天成立的事实
 """
 
 from __future__ import annotations
@@ -14,8 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-import unicodedata
-from datetime import UTC
+from datetime import UTC, date
 
 from sqlalchemy import text
 
@@ -28,23 +29,12 @@ from app.services import (
     embedding_service,
     ingestion_service,
     source_service,
+    timeline_render,
+    timeline_service,
     vector_index_service,
 )
 from app.services.embedding_service import EmbeddingUnavailable
-
-
-def _display_width(text: str) -> int:
-    """终端显示宽度：CJK 全角字符占两列。
-
-    直接用 f-string 的 `<20` 是按字符数补齐的，中英文混排必然错位，
-    来源名一长（github_release_transformers）还会把后一列顶出去。
-    """
-
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
-
-
-def _pad(text: str, width: int) -> str:
-    return text + " " * max(0, width - _display_width(text))
+from app.utils.text_width import display_width, pad
 
 
 
@@ -75,13 +65,13 @@ async def _list() -> int:
         )
 
     widths = [
-        max(_display_width(header[index]), *(_display_width(row[index]) for row in rows)) if rows
-        else _display_width(header[index])
+        max(display_width(header[index]), *(display_width(row[index]) for row in rows)) if rows
+        else display_width(header[index])
         for index in range(len(header))
     ]
 
     def render(cells: tuple[str, ...]) -> str:
-        return "  ".join(_pad(cell, widths[i]) for i, cell in enumerate(cells)).rstrip()
+        return "  ".join(pad(cell, widths[i]) for i, cell in enumerate(cells)).rstrip()
 
     print(render(header))
     print("-" * (sum(widths) + 2 * (len(widths) - 1)))
@@ -330,6 +320,54 @@ async def _embedding_coverage(session) -> dict:
     }
 
 
+# --------------------------------------------------------------- 时间线
+
+
+def _cap(show_all: bool) -> int:
+    """`--all` 时把「每个谓词显示几条」抬到不可能触顶，而不是在渲染里分支。"""
+
+    return 1 << 20 if show_all else timeline_render.PREDICATE_CAP
+
+
+def _unknown_entity(name: str) -> int:
+    """查不到实体时把规范化键也打出来。
+
+    实体是被事实用过的写法，同一个东西常有中英两行（`英伟达` / `NVIDIA`）。
+    只回一句「没找到」，用户会以为功能坏了；给出键至少能自证查的是什么。
+    """
+
+    key = timeline_service.normalize_key(name)
+    print(f"没有找到实体：{name}（规范化键：{key or '空'}）")
+    print("实体在抽取时创建，只有被事实用过的写法才存在。换个写法再试，或先跑抽取。")
+    return 1
+
+
+async def _timeline(name: str, limit: int, show_all: bool) -> int:
+    async with session_scope() as session:
+        result = await timeline_service.entity_timeline(session, name, limit=limit)
+    if result is None:
+        return _unknown_entity(name)
+    for line in timeline_render.format_timeline(result, per_predicate=_cap(show_all)):
+        print(line)
+    return 0
+
+
+async def _asof(name: str, on: date, limit: int, show_all: bool) -> int:
+    async with session_scope() as session:
+        result = await timeline_service.as_of(session, name, on, limit=limit)
+    if result is None:
+        return _unknown_entity(name)
+    note = f"在 {on.isoformat()} 成立"
+    for line in timeline_render.format_timeline(
+        result,
+        per_predicate=_cap(show_all),
+        note=note,
+        empty_hint="这天没有成立的事实",
+    ):
+        print(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description="DevInsight AI 运维命令行")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -398,6 +436,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="只建标题摘要块（每篇一条，几秒钟），不碰正文块",
     )
+    timeline_parser = sub.add_parser("timeline", help="查看实体的时间线")
+    timeline_parser.add_argument("name", help="实体名，如 英伟达 / OpenAI")
+    timeline_parser.add_argument("--limit", type=int, default=200, help="最多取多少条事实")
+    timeline_parser.add_argument("--all", action="store_true", help="同一谓词不限显示条数")
+
+    asof_parser = sub.add_parser("asof", help="某实体在指定日期成立的事实（双时间表）")
+    asof_parser.add_argument("name", help="实体名，如 英伟达 / OpenAI")
+    asof_parser.add_argument("--on", required=True, metavar="YYYY-MM-DD", help="查询基准日")
+    asof_parser.add_argument("--limit", type=int, default=200, help="最多取多少条事实")
+    asof_parser.add_argument("--all", action="store_true", help="同一谓词不限显示条数")
+
     return parser
 
 
@@ -425,6 +474,15 @@ def main(argv: list[str] | None = None) -> int:
                 return await _refingerprint(args.all_sources)
             if args.command == "embed":
                 return await _embed(args.limit, args.reindex, args.headers_only)
+            if args.command == "timeline":
+                return await _timeline(args.name, args.limit, args.all)
+            if args.command == "asof":
+                try:
+                    on = date.fromisoformat(args.on)
+                except ValueError:
+                    print(f"--on 需要 YYYY-MM-DD 格式：{args.on}")
+                    return 2
+                return await _asof(args.name, on, args.limit, args.all)
             return 2
         finally:
             await dispose_engine()
