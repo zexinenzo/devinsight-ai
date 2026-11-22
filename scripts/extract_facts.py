@@ -55,6 +55,16 @@
 所以状态记在 `documents.facts_extracted_at` 上，且**只记确定回答**：抽到事实、或明确
 「本文没有」都算；截断/空响应/格式错不算，否则一篇被截断的文档会被永久跳过。
 改提示词或换模型要全量重来，用 `--reprocess` 显式打开，不要让默认行为悄悄变成重抽。
+
+**8. 定向重跑只重跑「出过错」的文档，而且必须看得见「模型没变」。** 词表改完之后，
+唯一能证明改动有效的东西是拿同一批文档再问一次。全量重抽是几百次调用，而真正
+需要复核的是产出过撤回记录的那十几篇——所以 `--only-retracted` 直接按
+`fact_claims.retracted_at IS NOT NULL` 反查文档，不经过 `--limit` 的「最新 N 篇」。
+
+这里有个反直觉的地方必须写进日志：模型如果**又一次**给出同一个错宾语，唯一约束会
+静默跳过它，撤回状态保留，统计上只多一条 `重复`。于是「模型改对了」和「模型一字未改」
+在计数上都是「写库 0 条」——差别只在有没有新行。所以重复行现在会单独打一行标记，
+否则重跑一遍看不出任何变化，而这两种情况的结论完全相反。
 """
 
 from __future__ import annotations
@@ -138,11 +148,21 @@ def build_documents_query(args):
     默认排除 `facts_extracted_at IS NOT NULL`：模型已经把这篇判定过了，
     再送一次只会得到同一段输出，然后撞上唯一约束。`--reprocess` 打开时才全量重抽
     （改提示词或换模型时用，那是唯一需要重抽的场景）。
+
+    `--only-retracted` 是 `--reprocess` 的**精确子集**：只取产出过撤回记录的文档。
+    它必须绕开 `facts_extracted_at IS NULL` 那道闸——这些文档恰恰是「已判定」的，
+    走默认分支会一条都取不到，然后打印「没有候选」,看起来像「没有要复核的东西」。
     """
     stmt = select(Document).where(
         or_(Document.content_text.is_not(None), Document.summary.is_not(None))
     )
-    if not getattr(args, "reprocess", False):
+    if getattr(args, "only_retracted", False):
+        stmt = stmt.where(
+            Document.id.in_(
+                select(FactClaim.document_id).where(FactClaim.retracted_at.is_not(None))
+            )
+        )
+    elif not getattr(args, "reprocess", False):
         stmt = stmt.where(Document.facts_extracted_at.is_(None))
     if args.since:
         stmt = stmt.where(Document.published_at >= datetime.fromisoformat(args.since))
@@ -150,7 +170,11 @@ def build_documents_query(args):
         pattern = f"%{args.keyword}%"
         stmt = stmt.where(or_(Document.title.ilike(pattern), Document.summary.ilike(pattern)))
     # 有正文的优先：摘要常常只有「某公司发布了新产品」，缺日期和细节
-    stmt = stmt.order_by(Document.published_at.desc().nullslast()).limit(args.limit)
+    stmt = stmt.order_by(Document.published_at.desc().nullslast())
+    # limit=0 表示不限。定向重跑必须能不限——截断到 10 篇的表现是「跑了，还剩几条
+    # 没复核却看不出来」，和静默丢条目是同一种病。
+    if args.limit:
+        stmt = stmt.limit(args.limit)
     return stmt
 
 
@@ -243,7 +267,12 @@ def resolve_date_source(fact: ExtractedFact, document: Document) -> tuple[date |
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="从文档抽取结构化事实")
-    parser.add_argument("--limit", type=int, default=10, help="最多处理多少篇文档")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="最多处理多少篇文档（默认 10；0 表示不限，--only-retracted 时默认不限）",
+    )
     parser.add_argument("--since", default="", help="只处理该日期之后发布的文档（YYYY-MM-DD）")
     parser.add_argument("--keyword", default="", help="标题或摘要包含该关键词")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -254,7 +283,18 @@ async def main() -> int:
         action="store_true",
         help="连已判定过的文档一起重抽（只在改了提示词或换了模型时用；默认跳过）",
     )
+    parser.add_argument(
+        "--only-retracted",
+        dest="only_retracted",
+        action="store_true",
+        help="只重抽产出过撤回记录的文档（阶段 8 第 8 步的定向复核；无需再写 --reprocess）",
+    )
     args = parser.parse_args()
+    # 默认值要按模式分：普通增量跑 10 篇是保护预算；定向复核的候选集本来就只有十几篇，
+    # 截到 10 篇等于「少复核了几条」而日志上看不出来。用 None 当哨兵才能区分
+    # 「用户没写 --limit」和「用户写了 --limit 10」。
+    if args.limit is None:
+        args.limit = 0 if args.only_retracted else 10
 
     try:
         client = require_llm()
@@ -266,8 +306,14 @@ async def main() -> int:
     stats = Stats()
     async with session_scope() as session:
         documents = await pick_documents(session, args)
-        scope = "含已判定过的（--reprocess）" if args.reprocess else "跳过已判定过的"
-        print(f"待处理文档 {len(documents)} 篇（limit={args.limit}，{scope}）")
+        if args.only_retracted:
+            scope = "只含产出过撤回记录的"
+        elif args.reprocess:
+            scope = "含已判定过的（--reprocess）"
+        else:
+            scope = "跳过已判定过的"
+        limit_text = str(args.limit) if args.limit else "不限"
+        print(f"待处理文档 {len(documents)} 篇（limit={limit_text}，{scope}）")
 
         for index, document in enumerate(documents, start=1):
             stats.documents += 1
@@ -382,6 +428,10 @@ async def main() -> int:
                     stats.written += 1
                 else:
                     stats.duplicated += 1
+                    # 重跑时这一行是**唯一**能区分「模型改对了」和「模型一字未改」的证据：
+                    # 两种情况都是「写库 0 条」，差别只在有没有这条同宾语的重复行。
+                    # 不打印，重跑一遍日志看起来毫无变化，而这两种情况的结论完全相反。
+                    print(f"      ↳ 已存在，未写入：{fact.object_text}")
 
             if args.apply and index % 10 == 0:
                 await session.commit()

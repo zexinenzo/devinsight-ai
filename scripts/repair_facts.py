@@ -9,6 +9,8 @@
     .venv/bin/python scripts/repair_facts.py supersede --list                    # 谁该被闭合
     .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新>        # 闭合区间
     .venv/bin/python scripts/repair_facts.py supersede --id <旧> --by <新> --undo
+    .venv/bin/python scripts/repair_facts.py recheck                        # 撤回有没有接替者
+    .venv/bin/python scripts/repair_facts.py recheck --link                 # 登记唯一确定的那些
 
 **`audit` 为什么只读。** 判定与执行必须分开，否则就成了「让模型给自己判卷」——
 判定结果一旦能直接落库，就没有第二双眼睛看过它。中间那一步是人。
@@ -48,6 +50,17 @@
 **② 的判据是启发式，会误报。** 比如中文四字的人名与四字产品名无法区分（`黄仁勋` 与
 `通义千问` 都会命中）。这是可接受的：队列是只读的，误报的代价是人工多看一眼；
 而漏报的代价是一条错事实留在时间线上，没人知道它错。
+
+**`recheck` 是撤回的下半场。** 撤回只说了「这条是错的」，没回答「那对的在哪」。
+改完词表做定向重跑（`extract_facts.py --only-retracted`）之后，新记录会落在同文档、
+同主语、同谓词的位置上，但唯一约束含 `object_text`，所以新行只是新行——和旧的错行
+没有任何联系。`recheck` 负责把这条联系找出来，判据与设计稿第 6 节一致：同位置 +
+旧记录被判违规 + 新记录证据 `exact`，三条不齐就留空。`--link` 只写
+`retracted_replaced_by` 一列，事实行一个字不动。
+
+**它故意不替你判断的地方**：候选 0 条时，「模型这次什么都没给」和「模型又给了旧宾语、
+被唯一约束挡掉」在数据库里长得一模一样；候选多条的对应关系同样定不准。两种都打印
+并留空，因为在这两处猜一次的代价，是把「知道是错的」换成「不知道对不对」。
 """
 
 from __future__ import annotations
@@ -67,8 +80,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 API_DIR = SCRIPTS_DIR.parent / "apps" / "api"
 sys.path.insert(0, str(API_DIR))
 
-from app.db.models import Entity, FactClaim
+from app.db.models import Document, Entity, FactClaim
 from app.db.session import session_scope
+from app.services.fact_extraction import evidence_match
 from app.services.predicate_specs import PREDICATE_SPECS
 from app.services.timeline_service import (
     DATE_SOURCE_LABELS,
@@ -1043,6 +1057,183 @@ async def run_supersede(args) -> int:
         return 0
 
 
+# --- recheck：定向重跑之后，哪条新事实接替了哪条旧事实 ----------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacementCandidate:
+    """一条「同文档、同主语组、同谓词」的现存记录，可能接替了被撤回的那条。"""
+
+    id: uuid.UUID
+    object_text: str
+    evidence_text: str | None
+    match: str
+    valid_from: date | None
+
+    @property
+    def exact(self) -> bool:
+        return self.match == "exact"
+
+
+def pick_replacement(
+    old_object: str, candidates: list[ReplacementCandidate]
+) -> tuple[ReplacementCandidate | None, str]:
+    """从候选里挑唯一的接替者。返回 (选中或 None, 说明)。
+
+    判定就是设计稿第 6 节那三条：第 1 条（同一文档 + 同一主语 + 同一谓词）由调用方
+    的查询保证，第 2 条（旧记录确实被判违规）由「只传撤回过的行」保证，这里管剩下的
+    第 3 条——**替换方必须比被替换方更硬**。
+
+    三条不齐就**只插入、不登记替换**。代价是留着一批「被撤回了但没人接替」的记录，
+    收益是永远不会因为重抽而把一条本来对的记录说成已被取代。后者不可恢复。
+    """
+
+    if not candidates:
+        return None, (
+            "同位置上没有新记录。两种可能含义相反：模型这次在这个（文档·主语·谓词）"
+            "上一个字都没给，或者它给的还是旧宾语、被唯一约束挡掉了。"
+            "后者在重跑日志里会有一行「已存在，未写入」——回去看日志，别在这里猜。"
+            "如果还没跑过定向重跑，这一步本来就会全是这一种：先跑 "
+            "`extract_facts.py --only-retracted --apply`。"
+        )
+
+    if len(candidates) > 1:
+        listing = "、".join(f"`{item.object_text}`" for item in candidates)
+        return None, (
+            f"有 {len(candidates)} 条候选（{listing}），定不了哪条接替了 `{old_object}`。"
+            "定不准就留空，需要人工确认后用 retract --id … --replaced-by … 指定。"
+        )
+
+    only = candidates[0]
+    if not only.exact:
+        return None, (
+            f"唯一候选 `{only.object_text}` 的证据只有 {only.match}，不满足第 3 条。"
+            "拿一条无法在原文里核对的记录去接替一条已判定违规的记录，"
+            "等于把错误从「知道是错的」换成「不知道对不对」——那比留着更糟。"
+        )
+
+    return only, ""
+
+
+async def run_recheck(args) -> int:
+    """复核撤回记录：有没有新记录接替它，以及接替得硬不硬。
+
+    为什么需要这个子命令：`retracted_replaced_by` 从迁移 0010 起就在表里，但没有任何
+    自动化去填它。填它的唯一方式是人工抄两个 uuid —— 这个项目里抄 uuid 已经错了三次
+    （括号粘贴、抄反、终端卡死），所以判定必须由脚本算，人只负责看结论。
+
+    `--link` 只写**唯一且证据 exact** 的那些；其余一律打印并把判断留给人。
+    """
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(FactClaim, Document, Entity)
+                .join(Document, Document.id == FactClaim.document_id)
+                .join(Entity, Entity.id == FactClaim.subject_id)
+                .where(FactClaim.retracted_at.is_not(None))
+                .order_by(FactClaim.retracted_at.desc(), FactClaim.object_text)
+            )
+        ).all()
+
+        if not rows:
+            print("库里没有撤回记录，没有要复核的东西。")
+            return 0
+
+        document_ids = {fact.document_id for fact, _, _ in rows}
+        live = list(
+            (
+                await session.execute(
+                    select(FactClaim).where(
+                        FactClaim.document_id.in_(document_ids),
+                        FactClaim.retracted_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        entities = list((await session.execute(select(Entity))).scalars().all())
+        by_id = {entity.id: entity for entity in entities}
+
+        linked = 0
+        ambiguous = 0
+        unmatched = 0
+        skipped = 0
+
+        for fact, document, subject in rows:
+            print(f"\n{subject.name} --{fact.predicate}--> {fact.object_text}")
+            print(f"  id={fact.id}")
+            print(f"  撤回理由：{fact.retracted_reason}")
+            print(f"  文档：《{(document.title or '')[:40]}》")
+
+            if fact.retracted_replaced_by is not None:
+                print(f"  已登记接替者：{fact.retracted_replaced_by}")
+                skipped += 1
+                continue
+
+            root = build_entity_group(subject, entities).root
+            # 证据核对要用文档原文。`content_text` 为空时退回 summary——抽取时也是这么拼的，
+            # 两处不一致会让「当初判 exact 的」在这里变成 missing，凭空造出一批拒绝。
+            source = f"{document.title}\n{document.content_text or document.summary or ''}"
+
+            candidates: list[ReplacementCandidate] = []
+            for other in live:
+                if other.document_id != fact.document_id:
+                    continue
+                if other.predicate != fact.predicate:
+                    continue
+                entity = by_id.get(other.subject_id)
+                if entity is None:
+                    continue
+                if build_entity_group(entity, entities).root.id != root.id:
+                    continue
+                candidates.append(
+                    ReplacementCandidate(
+                        id=other.id,
+                        object_text=other.object_text,
+                        evidence_text=other.evidence_text,
+                        match=evidence_match(other.evidence_text, source),
+                        valid_from=other.valid_from,
+                    )
+                )
+
+            for cand in candidates:
+                mark = "✓" if cand.exact else "·"
+                print(
+                    f"  {mark} {_pad(cand.object_text, 24)}"
+                    f"{_pad(cand.match, 9)}{cand.id}"
+                )
+
+            chosen, reason = pick_replacement(fact.object_text, candidates)
+            if chosen is None:
+                print(f"  ⚠ {reason}")
+                if candidates:
+                    ambiguous += 1
+                else:
+                    unmatched += 1
+                continue
+
+            print(f"  → 接替者：{chosen.object_text}")
+            if args.link:
+                fact.retracted_replaced_by = chosen.id
+            linked += 1
+
+    verb = "已写库" if args.link else "只读，未写库"
+    print(
+        f"\n共 {len(rows)} 条撤回：{linked} 条能确定接替者，"
+        f"{ambiguous} 条多候选定不了，{unmatched} 条同位置没有新记录"
+        + (f"，{skipped} 条先前已登记" if skipped else "")
+        + f"。（{verb}）"
+    )
+    if not args.link and linked:
+        print(
+            "确认无误后加 --link 重跑一次，把这些接替关系登记进 "
+            "`retracted_replaced_by`——只登记，不改任何事实行。"
+        )
+    return 0
+
+
 def _span_text(start: date | None, end: date | None) -> str:
     return f"{start.isoformat() if start else '?'} → {end.isoformat() if end else '至今'}"
 
@@ -1050,7 +1241,7 @@ def _span_text(start: date | None, end: date | None) -> str:
 async def main() -> int:
     parser = argparse.ArgumentParser(
         description="事实审计与修复（audit 只读；retract 撤回不删除；merge 合并实体；"
-        "supersede 闭合区间）"
+        "supersede 闭合区间；recheck 复核撤回有没有接替者）"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1098,11 +1289,23 @@ async def main() -> int:
         help="只读：列出该被闭合的候选对，并打印可复制的 supersede 命令",
     )
 
+    recheck = sub.add_parser(
+        "recheck",
+        help="复核撤回记录：有没有新记录接替它（定向重跑之后用；默认只读）",
+    )
+    recheck.add_argument(
+        "--link",
+        action="store_true",
+        help="把「唯一且证据 exact」的接替关系写进 retracted_replaced_by（只写这一列）",
+    )
+
     args = parser.parse_args()
     if args.command == "audit":
         return await run_audit(args)
     if args.command == "merge":
         return await run_merge(args)
+    if args.command == "recheck":
+        return await run_recheck(args)
     if args.command == "supersede":
         if args.list_candidates:
             return await run_supersede_list(args)

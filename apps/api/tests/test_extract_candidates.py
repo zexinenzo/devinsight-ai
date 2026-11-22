@@ -47,7 +47,13 @@ extract_facts = _load_script()
 
 
 def _sql(**overrides) -> str:
-    options = {"since": "", "keyword": "", "limit": 10, "reprocess": False}
+    options = {
+        "since": "",
+        "keyword": "",
+        "limit": 10,
+        "reprocess": False,
+        "only_retracted": False,
+    }
     options.update(overrides)
     return str(extract_facts.build_documents_query(Namespace(**options)))
 
@@ -70,6 +76,35 @@ def test_newest_first_is_kept() -> None:
     """去重不能顺手把排序改掉：新文档优先，旧冷门文档天然沉底。"""
     sql = _sql()
     assert "ORDER BY documents.published_at DESC NULLS LAST" in sql
+
+
+def test_only_retracted_reverses_the_extracted_gate() -> None:
+    """定向重跑取的正是「已判定过」的文档，所以必须绕开 `facts_extracted_at IS NULL`。
+
+    这一条最容易写错的地方是**不报错**：走默认分支时查询合法、返回 0 行，日志打印
+    「待处理文档 0 篇」——看起来像「没有要复核的东西」，实际是条件互斥。定向重跑
+    的全部价值就在于它精确地取到那十几篇，取不到等于什么都没做。
+    """
+    sql = _sql(only_retracted=True)
+    assert "documents.facts_extracted_at IS NULL" not in sql
+    assert "fact_claims.retracted_at IS NOT NULL" in sql
+
+
+def test_only_retracted_still_requires_body_or_summary() -> None:
+    """精确取文档不等于放弃「有正文」这条：没有正文的文档重抽也抽不出东西。"""
+    sql = _sql(only_retracted=True)
+    assert "documents.content_text IS NOT NULL" in sql
+
+
+def test_limit_zero_means_no_limit() -> None:
+    """0 表示不限。
+
+    定向复核的候选集只有十几篇，若沿用默认 10 篇，表现是「跑完了，还剩几条没复核」
+    而日志上看不出来——和静默丢条目是同一种病。默认值按模式分由 `main` 决定：
+    普通增量 10 篇保护预算，`--only-retracted` 时不限。
+    """
+    assert "LIMIT" not in _sql(limit=0).upper()
+    assert "LIMIT" in _sql(limit=10).upper()
 
 
 def test_still_requires_body_or_summary() -> None:
