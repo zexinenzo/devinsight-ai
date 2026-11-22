@@ -29,53 +29,24 @@ from app.db.models import Document, Entity, FactClaim
 
 # 受控谓词表。**谓词不能由模型自由生成**，否则同一个动作会散成十种写法
 # （released / launched / unveiled / 推出 / 发布），按谓词聚合的时间线就拼不起来。
-# 加新谓词要同时改这里和抽取 prompt，两边不一致时抽取脚本会在落库前报错。
+#
+# 定义在 `predicate_specs.py`，这里只是重新导出：那张表同时喂给抽取 prompt、
+# 冲突判定的单值/多值分档、审计的形状检查。这个文件曾经自己维护一份谓词表、
+# 一份多值名单，结果是 `released_version` 在名字表里有、在名单里没有——
+# 三组「本来就并存」的记录被当成前后任报了出来。**两张表就会不一致，一张不会。**
+#
+# 保留旧导入路径是有意的：`fact_extraction`、测试与 repair 脚本都从这里拿，
+# 换路径只会制造一次无收益的改动。但保留不等于可以各存一份——本文件里**不应**
+# 再出现 `PREDICATES = {...}` 这样的字面量，重构时漏删过一次，是 `is` 断言抓出来的。
 #
 # 约定：**主语是公司或产品，不是人**。「OpenAI 的 CEO 是 Sam Altman」记成
 # subject=OpenAI, predicate=ceo, object=Sam Altman。这样查一家公司能一次拿到
 # 历任 CEO，而且两个 CEO 的任职区间同时成立时能被 `find_overlaps` 抓出来。
-PREDICATES: dict[str, str] = {
-    "released": "发布产品或模型",
-    "released_version": "发布具体版本号",
-    "announced": "宣布但未交付",
-    "discontinued": "下线或停服",
-    "acquired": "收购（主语是收购方）",
-    "partnered_with": "建立合作",
-    "ceo": "CEO 由谁担任",
-    "founded": "创立",
-    "funded": "获得融资",
-    "layoff": "裁员",
-    "open_sourced": "开源",
-    "benchmark": "基准测试成绩",
-}
+from app.services.predicate_specs import MULTI_VALUED_PREDICATES, PREDICATES  # noqa: E402
 
-# 多值谓词：同一时刻可以同时成立多个宾语，彼此不是替代关系。
-#
-# **名单之外的谓词一律按「单值」处理。** 这个默认方向是刻意的：漏报的表现是
-# 「时间线上两条矛盾并存却没人提示」，比多报危险得多，所以未知谓词宁可误报。
-#
-# 这个名单是合并 NVIDIA / 英伟达 之后才补的。合并前两组事实各自算冲突，
-# 合并后 `partnered_with` 的 6 条合作方进了同一次两两比较，一次产出 15 条
-# 「冲突」——台积电、富士康、安靠、矽品、景硕、三星电机当然可以同时都是伙伴。
-# 而这 18 条里真正的冲突只有 3 条，且渲染层只显示前 5 条，于是 15 条噪音
-# **把 3 条真信号全部挤出了视野**。多报的代价不是「多看几行」，是真信号被埋。
-MULTI_VALUED_PREDICATES: frozenset[str] = frozenset(
-    {
-        "released",  # 可以发布多个产品
-        # 一个项目同时有多个在维护的版本线：nginx 1.30.7（stable）与 1.31.9（mainline）
-        # 并行发布，两条都成立。同一模型的多种量化权重（BF16 / FP8 / NVFP4）、
-        # 同一系列的多个变体（Astra / Sol）同理——它们不是前后任，是同时存在。
-        "released_version",
-        "announced",  # 可以宣布多件事
-        "discontinued",  # 可以下线多个功能或产品线
-        "acquired",  # 可以收购多家公司
-        "partnered_with",  # 合作关系天然多值
-        "funded",  # 可以多轮融资
-        "layoff",  # 可以多次裁员
-        "open_sourced",  # 可以开源多个仓库
-        "benchmark",  # 多个基准成绩并存
-    }
-)
+# 单值/多值分档也从 `predicate_specs` 派生，理由同上：手维护的第二张名单
+# 漏过两次（`partnered_with` 六条产出 15 条假冲突、`released_version` 三组）。
+# 判定口径写在 `PredicateSpec.multi_valued` 旁边：**存在性还是唯一性**。
 
 KINDS = ("company", "product", "person", "model", "org")
 

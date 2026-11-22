@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 
+from app.services.predicate_specs import OBJECT_TYPES, SPECS
 from app.services.timeline_service import KINDS, PREDICATES, normalize_key
 
 SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事实。
@@ -94,12 +95,33 @@ class ExtractedFact:
 
 
 def build_prompt(predicates: dict[str, str] | None = None) -> str:
-    table = predicates or PREDICATES
-    lines = "\n".join(f"- {key}：{label}" for key, label in table.items())
+    lines = _predicate_lines(predicates) if predicates else _spec_lines()
     # 用 replace 而不是 format：SYSTEM_PROMPT 里有 JSON 示例，`{` `}` 会被 format
     # 当成占位符，第一次调用就 KeyError。这个坑直到给 build_prompt 写测试才暴露——
     # 在此之前它一次都没被调用过。
     return SYSTEM_PROMPT.replace("{predicates}", lines)
+
+
+def _spec_lines() -> str:
+    """谓词表由 `predicate_specs.SPECS` 渲染，宾语类型和代码判定同源。
+
+    这里多加的那半句（「宾语：产品、模型或功能名」）以前只写在规则 3 和规则 10 里，
+    而且是散文形式：「benchmark 的 object 只填评测集或榜单名」。结果是模型知道
+    benchmark 该怎么填、不知道 `founded` 该填年份还是人名——那一条正是靠审计 ② 档
+    事后抓出来的（`英伟达 --founded--> 黄仁勋`）。类型属于谓词的定义，就该跟谓词
+    写在同一行。
+    """
+
+    return "\n".join(
+        f"- {spec.key}：{spec.label}（宾语：{spec.hint or OBJECT_TYPES[spec.object_type]}）"
+        for spec in SPECS
+    )
+
+
+def _predicate_lines(predicates: dict[str, str]) -> str:
+    """测试与临时实验用的覆盖入口：只给名字和标签，不带宾语类型。"""
+
+    return "\n".join(f"- {key}：{label}" for key, label in predicates.items())
 
 
 def parse_facts_json(content: str) -> list[dict]:

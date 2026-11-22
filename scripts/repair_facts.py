@@ -69,6 +69,7 @@ sys.path.insert(0, str(API_DIR))
 
 from app.db.models import Entity, FactClaim
 from app.db.session import session_scope
+from app.services.predicate_specs import PREDICATE_SPECS
 from app.services.timeline_service import (
     DATE_SOURCE_LABELS,
     MAX_MERGE_DEPTH,
@@ -188,32 +189,42 @@ def looks_like_person(text: str) -> bool:
 def object_shape_reason(predicate: str, object_text: str) -> str | None:
     """② 档：不看原文，只看宾语长什么形状就该起疑的情形。
 
-    只覆盖三个谓词。不追求完备——完备等于给 12 个谓词各写一套类型系统，
-    那是第 7 节 `object_type` 的活，不该在回补历史时重做一遍。
+    检查哪几条由 `predicate_specs.PredicateSpec.object_type` 决定，不在这里按谓词名
+    分支。原来这里写着 `if predicate == "founded" / "ceo" / "funded"`——那三行和
+    prompt 里「宾语该填什么」是同一份知识的两遍手抄，而 prompt 只对 benchmark 明说
+    过宾语类型。**类型写在谓词的定义里，就该从定义里读出来**，否则加一个谓词
+    就多一处可能忘记同步的判断。
+
+    仍然只覆盖「有形状可查」的三类：年份/机构、人名、金额。许可证明明有形状，
+    但它归 ① 档管（与谓词无关的那个位置不能放许可证），不重复判。
     """
+
+    spec = PREDICATE_SPECS.get(predicate)
+    if spec is None:
+        return None
     text = object_text.strip()
 
-    if predicate == "founded":
+    if spec.object_type == "year_or_org":
         # 创立的宾语应该是年份或机构。填人名不是错在「人不能创立公司」，
         # 而是错在这个位置该记「何时/由谁做主语」，把它填到宾语上会让
         # 时间线变成「OpenAI 创立了 Sam Altman」。
         if YEAR_RE.match(text) or COMPANY_HINT_RE.search(text):
             return None
-        return "founded_object_not_year_or_org"
+        return f"{predicate}_object_not_{spec.object_type}"
 
-    if predicate == "ceo":
+    if spec.object_type == "person":
         if looks_like_person(text):
             return None
-        return "ceo_object_not_person"
+        return f"{predicate}_object_not_{spec.object_type}"
 
-    if predicate == "funded":
+    if spec.object_type == "amount":
         if AMOUNT_OR_ROUND_RE.search(text) or FINANCING_EVENT_RE.search(text):
             return None
         if DEBT_FACILITY_RE.search(text):
             return "funded_object_is_debt_facility"
         # 剩下的多半是宾语填了投资方/被投方（`英伟达 --funded--> 矽品精密`），
         # 方向反了或者槽位错位。统一的理由就够：人工看一眼 evidence 就知道是哪种
-        return "funded_object_is_not_amount"
+        return f"{predicate}_object_is_not_amount"
 
     return None
 
