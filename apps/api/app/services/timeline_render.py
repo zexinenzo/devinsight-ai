@@ -60,6 +60,7 @@ def format_timeline(
     per_predicate: int = PREDICATE_CAP,
     note: str | None = None,
     empty_hint: str = "没有带日期的事实",
+    dated_label: str = "条有日期",
 ) -> list[str]:
     """把一次查询渲染成若干行。调用方只负责 print，不再做判断。"""
 
@@ -68,7 +69,7 @@ def format_timeline(
         title = f"{title} · {note}"
     lines = [title]
 
-    meta = [f"{result.dated_count} 条有日期"]
+    meta = [f"{result.dated_count} {dated_label}"]
     if result.undated_count:
         meta.append(f"{result.undated_count} 条时间未知")
     if result.retracted_count:
@@ -111,10 +112,17 @@ def format_timeline(
 
     if result.later:
         lines.append("")
-        lines.append(
-            f"  有 {len(result.later)} 条事实的起点晚于该日——"
-            "对当天的状态是「不知道」，不是「不是这样」："
-        )
+        if result.entries:
+            # 当天已经有成立的事实，这一节只是补充「还有一部分判不了」。
+            # 沿用全空时那句「不知道」，会把上面刚答上的部分一并否掉。
+            lines.append(
+                f"  另有 {len(result.later)} 条事实的起点晚于该日，未计入当天快照："
+            )
+        else:
+            lines.append(
+                f"  有 {len(result.later)} 条事实的起点晚于该日——"
+                "对当天的状态是「不知道」，不是「不是这样」："
+            )
         for entry in result.later[:_LATER_SHOWN]:
             lines.append(_entry_line(entry))
         if len(result.later) > _LATER_SHOWN:

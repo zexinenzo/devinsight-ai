@@ -363,6 +363,7 @@ async def _asof(name: str, on: date, limit: int, show_all: bool) -> int:
         per_predicate=_cap(show_all),
         note=note,
         empty_hint="这天没有成立的事实",
+        dated_label="条在该日成立",
     ):
         print(line)
     return 0
