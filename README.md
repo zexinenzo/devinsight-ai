@@ -987,6 +987,35 @@ make extract ARGS="--limit 500 --apply"                 # 写库；幂等，可�
 CEO 仍然挂在两个 id 上。`--undo` 一次清三列（`valid_to` / `valid_to_reason` /
 `superseded_by`），只清日期会留下一条「有指针但没结束日」的记录。
 
+### 复核：撤回之后有没有人接替
+
+```bash
+# 只重抽「产出过撤回记录」的文档（不需要再写 --reprocess；默认不限篇数）
+.venv/bin/python scripts/extract_facts.py --only-retracted --dry-run
+.venv/bin/python scripts/extract_facts.py --only-retracted --apply
+
+# 看有没有新记录接替了被撤回的那条；确认后 --link 只写 retracted_replaced_by 一列
+.venv/bin/python scripts/repair_facts.py recheck
+.venv/bin/python scripts/repair_facts.py recheck --link
+```
+
+改词表只对**以后的调用**生效，库里已有的错记录一条都不会变。所以「改完词表」和
+「数据变好」之间没有因果关系，只有拿同一批文档再问一次才有。
+
+`--only-retracted` 必须绕开 `facts_extracted_at IS NULL` 那道闸——这些文档恰恰是
+「已判定」的，走默认分支会一行都取不到，然后打印「待处理文档 0 篇」，
+看起来像「没有要复核的东西」。
+
+**最反直觉的一处：模型一字未改时，日志也是「写库 0 条」。** 唯一约束含 `object_text`，
+模型如果又给出同一个错宾语，`ON CONFLICT DO NOTHING` 会静默跳过它，撤回状态原样保留。
+「改对了」与「一字未改」在计数上无法区分，差别只在有没有新行——所以重复行现在单独
+打一行「已存在，未写入」，否则重跑一遍看不出任何变化。
+
+`recheck` 有三处会主动停下来：0 条候选（「什么都没给」与「又给了旧宾语」在库里长得一样）、
+多条候选（对应关系定不准）、以及**多条里只有一条 `exact` 也拒绝**——`exact` 只证明那句话
+在原文里存在，不证明它就是接替者。留空的代价是少一份自动化记录，猜错的代价是把一条
+确知的错误换成一条「不知道对不对」的记录。
+
 
 ### 诚实边界
 
