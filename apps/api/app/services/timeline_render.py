@@ -26,6 +26,9 @@ from app.utils.text_width import pad
 PREDICATE_CAP = 3
 
 _DAY_WIDTH = 11
+# 「起点晚于该日」一节最多列几条。它的作用是给空结果一个成因，不是把整条时间线
+# 再倒着贴一遍——列满一屏反而盖住了「这天为什么是空的」这个重点。
+_LATER_SHOWN = 5
 _LABEL_WIDTH = 15
 
 
@@ -105,6 +108,17 @@ def format_timeline(
         )
         for entry in result.undated:
             lines.append(_entry_line(entry))
+
+    if result.later:
+        lines.append("")
+        lines.append(
+            f"  有 {len(result.later)} 条事实的起点晚于该日——"
+            "对当天的状态是「不知道」，不是「不是这样」："
+        )
+        for entry in result.later[:_LATER_SHOWN]:
+            lines.append(_entry_line(entry))
+        if len(result.later) > _LATER_SHOWN:
+            lines.append(f"  … 另有 {len(result.later) - _LATER_SHOWN} 条")
 
     if result.overlaps:
         lines.append("")

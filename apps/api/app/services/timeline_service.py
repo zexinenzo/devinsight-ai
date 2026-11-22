@@ -104,6 +104,11 @@ class TimelineResult:
     # 一次查询拿到两行的事实——**必须把这件事说出来**，否则「这家公司只有 3 条
     # 事实」和「它其实有 9 条，只是另外 6 条挂在另一种写法下」看起来一样。
     merged_names: list[str] = field(default_factory=list)
+    # 起点晚于查询日的事实（只有 `as_of` 会填）。它们回答不了「那天成立吗」，
+    # 但也**不构成「那天不成立」的证据**——这两句话在一个空结果里长得一模一样，
+    # 所以必须分开列。库里最早的报道是 11 月，问的是 6 月，答案是「不知道」，
+    # 不是「当时没有」。
+    later: list[TimelineEntry] = field(default_factory=list)
 
     @property
     def dated_count(self) -> int:
@@ -371,6 +376,24 @@ async def as_of(
     )
     for fact, document in (await session.execute(undated_stmt)).all():
         result.undated.append(_to_entry(fact, document))
+
+    # 起点晚于查询日的事实：查不到不等于不成立。
+    # 一条 2026-11-18 起算的记录，对 6 月 1 日既不支持也不反对——它只说明
+    # 我们手上最早的报道在这天之后。把这类条数报出来，空结果才有成因。
+    later_stmt = (
+        select(FactClaim, Document)
+        .join(Document, Document.id == FactClaim.document_id)
+        .where(
+            FactClaim.subject_id.in_(group_ids),
+            FactClaim.retracted_at.is_(None),
+            FactClaim.valid_from.is_not(None),
+            FactClaim.valid_from > on,
+        )
+        .order_by(FactClaim.valid_from.asc())
+        .limit(limit)
+    )
+    for fact, document in (await session.execute(later_stmt)).all():
+        result.later.append(_to_entry(fact, document))
 
     result.retracted_count = await _count_retracted(session, group_ids)
     result.overlaps = find_overlaps(result.entries)
