@@ -101,6 +101,7 @@ from app.services.fact_extraction import (
     to_fact as parse_raw_fact,
 )
 from app.services.llm_service import ChatMessage, LLMUnavailable, require_llm
+from app.services.predicate_specs import PREDICATE_SPECS
 from app.services.timeline_service import PREDICATES, normalize_key
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -537,6 +538,9 @@ async def main() -> int:
                     subject_id=subject.id,
                     predicate=fact.predicate,
                     object_text=fact.object_text,
+                    # 类型不是模型给的，是谓词推出来的：同一个谓词的宾语类型是固定的
+                    # （`released` 永远是 product），让模型再答一次只会多一个错源。
+                    object_type=PREDICATE_SPECS[fact.predicate].object_type,
                     valid_from=valid_from,
                     valid_from_source=date_source,
                     document_id=document.id,

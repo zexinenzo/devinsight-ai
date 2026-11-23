@@ -394,6 +394,20 @@ class FactClaim(Base):
             "valid_from_source IN ('stated', 'published', 'unknown')",
             name="from_source",
         ),
+        # 谓词闭集（迁移 0014）。抽取入口已经校验过一次，这里再拦一次是为了那些
+        # 不经过 `scripts/extract_facts.py` 的写入路径——判据放在入口，等于只防住
+        # 「从这扇门进的人」。
+        CheckConstraint(
+            "predicate IN ('released', 'released_version', 'announced', 'discontinued', 'acquired', 'partnered_with', 'ceo', 'founded', 'funded', 'layoff', 'open_sourced', 'benchmark')",
+            name="predicate_closed_set",
+        ),
+        # 宾语类型合法（迁移 0014）。与上一条的区别：上一条防造词，这一条防
+        # 「谓词对、类型写错」——后者会让 `object_shape_problem` 静默跳过这条记录，
+        # 校验看起来通过了，实际一条规则都没跑。
+        CheckConstraint(
+            "object_type IS NULL OR object_type IN ('product', 'version', 'org', 'person', 'year_or_org', 'amount', 'scale', 'benchmark')",
+            name="object_type",
+        ),
         # 撤回必须给理由：没有理由的撤回是一次不可审计的判断，
         # 而「不可审计」正是当初模型编造事实的同类问题
         CheckConstraint(
@@ -420,6 +434,12 @@ class FactClaim(Base):
     )
     predicate: Mapped[str] = mapped_column(Text, nullable=False)
     object_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 宾语类型，由谓词唯一决定（`PREDICATE_SPECS[predicate].object_type`）。
+    # 落库的理由不是「以后可能用到」：抽取期的形状校验按它选规则，不落库的话，
+    # 事后审计只能拿当前版本的 SPECS 去反推——而 SPECS 会改，历史行的判据就丢了。
+    # 允许 NULL 是给存量留路：迁移只回填能映射的谓词，映射不上的留空，
+    # 而不是拿一个猜出来的类型填满。
+    object_type: Mapped[str | None] = mapped_column(Text)
     object_entity_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entities.id", ondelete="SET NULL")
     )
