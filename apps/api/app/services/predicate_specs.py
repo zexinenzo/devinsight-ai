@@ -162,6 +162,16 @@ _GENERIC_RANKING_RE = re.compile(
 )
 
 
+# `amount` 的信号词：钱、轮次、发行。命中任一即放行。
+# 为什么是「命中即放行」而不是白名单：金额写法太散（`2.7亿元`、`$1.2B`、
+# `470 万欧元`、`近亿元`），列不全；而需要拒绝的正是一点信号都没有的
+# 投资方名字（`慧眼资本`、`源杰科技独家直投`）。
+_AMOUNT_HINT_RE = re.compile(
+    r"\d|亿|万元|万美元|轮|series|seed|angel|round|ipo|募股|上市|融资",
+    re.IGNORECASE,
+)
+
+
 def object_shape_problem(predicate: str, object_text: str) -> str | None:
     """抽取期形状检查：宾语与谓词声明的类型明显不符时返回原因码。
 
@@ -169,6 +179,7 @@ def object_shape_problem(predicate: str, object_text: str) -> str | None:
 
     - `product` / `benchmark` 的宾语是数量短语（`30 个库`、`18 public datasets`）
     - `benchmark` 的宾语是泛称榜单或评审团（`leaderboard`、`LLM judges panel`）
+    - `amount` 的宾语完全没有金额或轮次信号（`慧眼资本` 当融资轮次）
 
     只对这两种 `object_type` 生效，是因为其余类型的宾语本来就可能是数字开头：
     `version` 的 `1.30.7`、`year_or_org` 的 `2026`、`scale` 的 `1000 人`。
@@ -191,5 +202,10 @@ def object_shape_problem(predicate: str, object_text: str) -> str | None:
 
     if spec.object_type == "benchmark" and _GENERIC_RANKING_RE.search(text):
         return "object_is_generic_ranking"
+
+    # `amount` 只判「完全没有金额或轮次信号」。`慧眼资本` 这类投资方名字
+    # 会因为缺信号被拒；`近亿元融资`、`A++轮`、`IPO` 都能命中。
+    if spec.object_type == "amount" and not _AMOUNT_HINT_RE.search(text):
+        return "object_is_not_amount"
 
     return None

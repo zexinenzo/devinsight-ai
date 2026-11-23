@@ -33,6 +33,7 @@ SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事�
   "predicate": "从下方词表里选一个",
   "object": "事实的宾语：一个短名词短语，不超过 20 字",
   "valid_from": "YYYY-MM-DD 或 null",
+  "date_quote": "原文里支撑这个日期的最短片段，逐字复制；valid_from 为 null 时也填 null",
   "evidence": "支撑这句话的原文片段，不超过 80 字，必须是原文里真实存在的句子",
   "confidence": 0.0 到 1.0 的数字
 }
@@ -62,12 +63,20 @@ SYSTEM_PROMPT = """你是信息抽取器。从给定文章中抽取结构化事�
    「最近」「日前」这类无法定位到某一天的一律填 null。
    **不要只因为"文章有发布日期"就拿它当 valid_from**——一篇 2026 年的回顾文章写
    「2024 年发布 GPT-4o」，照抄发布日期会把这条事实挪到 2026 年。
+   填了 valid_from 就必须再填 date_quote：**原文里支撑这个日期的最短片段**，
+   逐字复制，不超过 40 字。不要写你换算后的形式（`2026-02-13`），要写原文怎么说。
+   例：valid_from="2026-02-13"，date_quote="于2月13日正式启动"。
+   找不到这样的片段，就把 valid_from 填 **null**，不要用发布日期充数——
+   用发布日期兜底是程序的事，那一档会标成 published，两者不能混。
 7. 不要抽「某篇文章提到了某公司」这类事。要的是这家公司做了什么。
 8. 同一件事只抽一次，不要因为文章多处提到就重复抽取。
 9. 抽不出符合词表的事实就返回空数组 []，这是正常结果。
 10. **同一个谓词的宾语类型必须固定。** benchmark 的 object 只填评测集或基准名
     （"Autoform-Hard"），分数与名次一律写进 evidence。**泛称的榜单**（"leaderboard"）
     与**评审团**（"LLM judges panel"）不是基准名，这类不抽。
+11. **funded 的 object 只填金额或轮次**（"近亿元融资"、"A++轮"、"IPO"），
+    不要填投资方名字。投资方属于证据，写进 evidence 里的原句，
+    例如 object="A++轮"、evidence="源杰科技独家投资的A++轮融资已完成"。
     反例：object="法律领域评测第一名" → 榜单名是"法律领域评测"，"第一名"是成绩，
     写进 evidence，不要写进 object。
 11. 宾语只有**泛称**时（"iPhone 版"、"partner plugins"），前面补上主语名或专名，
@@ -95,6 +104,9 @@ class ExtractedFact:
     valid_from: date | None
     evidence: str | None
     confidence: float
+    # 支撑 valid_from 的原文片段。不落库的话，「文中写了这一天」和「模型抄了
+    # 发布日期」在库里完全一样，而这两件事的可信度差一个档位。
+    date_quote: str | None = None
 
 
 def build_prompt(predicates: dict[str, str] | None = None) -> str:
@@ -286,6 +298,119 @@ def parse_date_value(value: object) -> date | None:
         return None
 
 
+# 日期在原文里的三种写法。顺序有讲究：先试精度高的，`2026年2月13日` 不能被
+# `2026年2月` 先吃掉，否则一条日级的事实会被判成月级、进而降档。
+_CN_YMD_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
+_ISO_YMD_RE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+_EN_YMD_RE = re.compile(
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*"
+    r"(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})",
+    re.IGNORECASE,
+)
+_CN_MD_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
+_CN_YM_RE = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月")
+
+_EN_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _mk_date(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def parse_date_in_text(
+    text: str, hint_year: int | None = None
+) -> tuple[date, str] | None:
+    """从原文片段里读出日期，返回 (日期, 精度)。精度是 `day` 或 `month`。
+
+    **只读到月时返回该月 1 日并标 `month`**，而不是拒绝或补一个猜出来的日：
+    调用方要回答的是「这个片段能支撑到哪一档」，月级片段不能支撑日级的日期，
+    但也不该被当成「片段里没有日期」。
+
+    `hint_year` 用于中文常见的「2月13日」写法——没有年份，用文章的发布年份补。
+    补年份不算编造：同一篇报道里不写年份的日期，含义就是当年的那一天。
+    """
+
+    if not text:
+        return None
+
+    match = _CN_YMD_RE.search(text)
+    if match:
+        got = _mk_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        return (got, "day") if got else None
+
+    match = _ISO_YMD_RE.search(text)
+    if match:
+        got = _mk_date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        return (got, "day") if got else None
+
+    match = _EN_YMD_RE.search(text)
+    if match:
+        got = _mk_date(
+            int(match.group(3)), _EN_MONTHS[match.group(1).lower()[:3]], int(match.group(2))
+        )
+        return (got, "day") if got else None
+
+    if hint_year is not None:
+        match = _CN_MD_RE.search(text)
+        if match:
+            got = _mk_date(hint_year, int(match.group(1)), int(match.group(2)))
+            return (got, "day") if got else None
+
+    match = _CN_YM_RE.search(text)
+    if match:
+        got = _mk_date(int(match.group(1)), int(match.group(2)), 1)
+        return (got, "month") if got else None
+
+    return None
+
+
+def verify_date_quote(
+    quote: str | None,
+    valid_from: date,
+    source_text: str,
+    hint_year: int | None = None,
+) -> str | None:
+    """引文能不能支撑这个日期。返回 None 表示能，否则返回降级原因。
+
+    四个原因码各有不同处置，所以分开返回而不是一个 False：
+
+    - `quote_missing`：填了日期却没有引文。最可能是从文章发布日期抄的。
+    - `quote_not_in_source`：引文不在原文里。要么模型改写了，要么整条在编。
+    - `quote_has_no_date`：引文在原文里，但里面读不出日期。常见于把整段当引文，
+      日期其实在别处——这种「证据里没有日期」的日期就是无源的。
+    - `quote_date_mismatch`：引文里的日期与 valid_from 冲突。最危险的一类，
+      因为它看起来有据可查，而据查出来是另一个日期。
+
+    月级引文只要求年月一致：日不可验，但年月对得上时它仍比 published 兜底准得多
+    ——兜底给的是发文那天，可能差几个月。**这一条是宽松的，代价写在文档里**：
+    `stated` 从此保证「年月有原文支撑」，不保证日。
+    """
+
+    if not quote:
+        return "quote_missing"
+    if _compact(quote) not in _compact(source_text):
+        return "quote_not_in_source"
+
+    parsed = parse_date_in_text(quote, hint_year)
+    if parsed is None:
+        return "quote_has_no_date"
+
+    got, precision = parsed
+    if precision == "month":
+        if (got.year, got.month) != (valid_from.year, valid_from.month):
+            return "quote_date_mismatch"
+        return None
+    if got != valid_from:
+        return "quote_date_mismatch"
+    return None
+
+
 def to_fact(raw: dict) -> tuple[ExtractedFact | None, str]:
     """把一条原始 JSON 转成 ExtractedFact，返回 (fact, 拒绝原因)。
 
@@ -333,6 +458,7 @@ def to_fact(raw: dict) -> tuple[ExtractedFact | None, str]:
     confidence = min(max(confidence, 0.0), 1.0)
 
     evidence = str(raw.get("evidence") or "").strip()[:400] or None
+    date_quote = str(raw.get("date_quote") or "").strip()[:200] or None
     return (
         ExtractedFact(
             subject=subject,
@@ -342,6 +468,7 @@ def to_fact(raw: dict) -> tuple[ExtractedFact | None, str]:
             valid_from=valid_from,
             evidence=evidence,
             confidence=confidence,
+            date_quote=date_quote,
         ),
         "",
     )

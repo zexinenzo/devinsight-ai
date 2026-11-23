@@ -452,6 +452,10 @@ class FactClaim(Base):
     valid_from_source: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'unknown'")
     )
+    # 支撑 valid_from 的原文片段（迁移 0015）。`stated` 从此可审计：
+    # 拿这句回原文比对，就能回答「这个日期是文中写的，还是抄了发布日期」。
+    # 允许 NULL——迁移之前的历史行没有这个字段，补不出来，也不该编一个。
+    date_quote: Mapped[str | None] = mapped_column(Text)
     # 系统时间：这条记录什么时候被写进来（事后复盘「当时我们知道什么」靠它）
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
