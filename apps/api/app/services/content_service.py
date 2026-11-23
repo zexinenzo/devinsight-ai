@@ -190,13 +190,21 @@ async def select_candidates(
         ),
     )
 
+    # 时间窗口单独拎出来，是为了能在 `within_days=0` 时整条不加。
+    # 这个条件原本写死在 where 里，后果是「14 天前没补上正文的文档永远补不上」——
+    # 而它的表现是「候选=10」，看起来像「只有 10 篇需要补」，完全看不出有四百多篇出局。
+    conditions = [
+        or_(Document.content_status == "pending", retryable_failure),
+        Document.source_id.not_in(
+            select(Source.id).where(Source.source_key.in_(NO_FETCH_SOURCES))
+        ),
+    ]
+    if within_days > 0:
+        conditions.append(Document.fetched_at >= func.now() - window)
+
     ranked = (
         select(Document.id.label("doc_id"), row_number.label("rn"))
-        .where(
-            or_(Document.content_status == "pending", retryable_failure),
-            Document.fetched_at >= func.now() - window,
-            Document.source_id.not_in(select(Source.id).where(Source.source_key.in_(NO_FETCH_SOURCES))),
-        )
+        .where(*conditions)
         .subquery()
     )
 
@@ -728,6 +736,7 @@ async def run_enrich(
     limit: int = 30,
     per_source: int = 10,
     concurrency: int = 4,
+    within_days: int = 14,
 ) -> dict[str, Any]:
     """按热度补全正文与指纹，返回分状态的计数。
 
@@ -740,7 +749,9 @@ async def run_enrich(
     repaired = await backfill_summaries_from_content(session)
     marked = await mark_self_posts_as_from_feed(session)
 
-    candidates = await select_candidates(session, limit=limit, per_source=per_source)
+    candidates = await select_candidates(
+        session, limit=limit, per_source=per_source, within_days=within_days
+    )
     # 这一批里有多少是「上次失败、退避已过」的条目。运维上必须能区分
     # 「在追新内容」和「在还旧账」：否则失败率长期降不下来时，看不出是重试在打转
     retried = sum(1 for document in candidates if document.content_status == "failed")

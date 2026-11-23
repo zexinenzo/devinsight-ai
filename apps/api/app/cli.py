@@ -125,10 +125,14 @@ async def _docs(limit: int) -> int:
     return 0
 
 
-async def _enrich(limit: int, per_source: int, concurrency: int) -> int:
+async def _enrich(limit: int, per_source: int, concurrency: int, window_days: int = 14) -> int:
     async with session_scope() as session:
         summary = await content_service.run_enrich(
-            session, limit=limit, per_source=per_source, concurrency=concurrency
+            session,
+            limit=limit,
+            per_source=per_source,
+            concurrency=concurrency,
+            within_days=window_days,
         )
     print(
         f"正文补全：候选={summary['selected']} 其中重试={summary['retried']} 成功={summary['fetched']} "
@@ -394,6 +398,13 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_parser.add_argument("--limit", type=int, default=30, help="本轮最多处理多少条")
     enrich_parser.add_argument("--per-source", type=int, default=10, help="每个源最多占多少名额")
     enrich_parser.add_argument("--concurrency", type=int, default=4, help="同时下载几页")
+    enrich_parser.add_argument(
+        "--window-days",
+        dest="window_days",
+        type=int,
+        default=14,
+        help="只补「抓取时间在 N 天内」的文档；0 表示不限（还历史欠账时用）",
+    )
 
     engagement_parser = sub.add_parser("engagement", help="回填 HN 热度（热度是抓正文的排序依据）")
     engagement_parser.add_argument("--days", type=int, default=14, help="只处理最近 N 天的条目")
@@ -466,7 +477,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "docs":
                 return await _docs(args.limit)
             if args.command == "enrich":
-                return await _enrich(args.limit, args.per_source, args.concurrency)
+                return await _enrich(
+                    args.limit, args.per_source, args.concurrency, args.window_days
+                )
             if args.command == "engagement":
                 return await _engagement(args.days, args.limit, args.concurrency)
             if args.command == "dedup":

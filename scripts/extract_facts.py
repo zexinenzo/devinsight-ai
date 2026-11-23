@@ -65,6 +65,14 @@
 静默跳过它，撤回状态保留，统计上只多一条 `重复`。于是「模型改对了」和「模型一字未改」
 在计数上都是「写库 0 条」——差别只在有没有新行。所以重复行现在会单独打一行标记，
 否则重跑一遍看不出任何变化，而这两种情况的结论完全相反。
+
+**9. 只有摘要的文档不该抽，也不该被标记为「已判定」。** 候选条件是「有正文或有摘要」，
+这个 OR 会把待补正文的文档一起放进来。2026-11-21 那批 20 篇里 19 篇没有正文，
+抽出的 12 条有 9 条日期只能按 published 兜底，而摘要基本是标题的复述。更糟的是
+`facts_extracted_at` 写在「本文无可抽事实」判断之前，于是这 19 篇连「从摘要里抽到
+1 条」和「什么都没抽到」都被标记了，enrich 补完正文也不会重抽。所以要有
+`--min-body-chars`（默认 0，行为不变）和 `--reset-no-body`（退回队列）。
+顺序上应该先 enrich 再抽取——抓正文不花 LLM，抽取花。
 """
 
 from __future__ import annotations
@@ -94,10 +102,35 @@ from app.services.fact_extraction import (
 )
 from app.services.llm_service import ChatMessage, LLMUnavailable, require_llm
 from app.services.timeline_service import PREDICATES, normalize_key
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 MAX_BODY_CHARS = 3000
+
+# 丢弃原因 → 中文名。键要和 `to_fact` 的返回值对齐：对不上时打出的是英文
+# reason code，读者会以为是程序出错。故意用 `.get(reason, reason)` 兜底而不是
+# 报错——新原因忘了登记时，宁可显示英文，也不要静默打印一个空标签。
+DROP_LABELS = {
+    "predicate": "谓词不在词表",
+    "reflexive": "主语与宾语相同",
+    "too_long": "宾语超长",
+    "malformed": "字段缺失",
+}
+
+
+def format_drop(index: int, raw: dict, reason: str) -> str:
+    """被丢弃条目的一行日志。
+
+    只给计数时，两种完全不同的情况在日志里长得一模一样：「丢了一条零信息量的自反」
+    和「丢了一条真事实、只是模型把它写成了整句」。前者不用管，后者要改 prompt。
+    计数告诉你发生了，留名才告诉你发生的是什么。
+    """
+
+    label = DROP_LABELS.get(reason, reason)
+    subject = str(raw.get("subject") or "?").strip() or "?"
+    predicate = str(raw.get("predicate") or "?").strip() or "?"
+    object_text = (str(raw.get("object") or "?").strip() or "?")[:40]
+    return f"[{index}] x 丢弃（{label}）：{subject} --{predicate}--> {object_text}"
 
 
 @dataclass(slots=True)
@@ -165,6 +198,15 @@ def build_documents_query(args):
         )
     elif not getattr(args, "reprocess", False):
         stmt = stmt.where(Document.facts_extracted_at.is_(None))
+    # 上面那条 OR 会放只有摘要的文档进来：抽出来 12 条里 9 条靠 published 兜底
+    # 日期，而摘要通常就是标题的复述，事实密度极低。门槛默认 0（行为完全不变），
+    # 批量跑时用 --min-body-chars 800 把缺正文的留给 enrich 补完再抽。
+    min_body = getattr(args, "min_body_chars", 0) or 0
+    if min_body > 0:
+        stmt = stmt.where(
+            Document.content_text.is_not(None),
+            func.length(Document.content_text) >= min_body,
+        )
     if args.since:
         stmt = stmt.where(Document.published_at >= datetime.fromisoformat(args.since))
     if args.keyword:
@@ -266,6 +308,45 @@ def resolve_date_source(fact: ExtractedFact, document: Document) -> tuple[date |
     return None, "unknown"
 
 
+def no_body_condition():
+    """「无正文却已被标记」的判定条件。
+
+    单独拎出来是为了能在不连库的情况下断言形状：这一条写错的表现是「重置了 0 篇」，
+    而「0 篇」和「本来就该是 0 篇」在日志上长得一样，看不出区别。
+    """
+
+    return and_(
+        Document.facts_extracted_at.is_not(None),
+        Document.content_text.is_(None),
+    )
+
+
+async def reset_no_body(session, apply: bool) -> int:
+    """把没有正文却已被标记的文档退回待抽取。
+
+    成因是候选条件 `content_text IS NOT NULL OR summary IS NOT NULL`——只有摘要的
+    文档也会进队列，而 `facts_extracted_at` 写在「本文无可抽事实」判断之前。
+    一旦标记，即使 enrich 补上了正文，默认查询也再不会选中它们。
+
+    这不是删数据：已入库的事实留在原位，重抽时重复的会撞唯一约束，只多一行「已存在」。
+    """
+
+    condition = no_body_condition()
+    total = (
+        await session.execute(select(func.count()).select_from(Document).where(condition))
+    ).scalar_one()
+    if not apply:
+        print(f"无正文且已标记：{total} 篇")
+        print("这是预演。加 --apply 执行重置，它们会回到待抽取队列")
+        return 0
+    result = await session.execute(
+        update(Document).where(condition).values(facts_extracted_at=None)
+    )
+    await session.commit()
+    print(f"已重置 {result.rowcount} 篇（无正文且已标记），下次抽取会重新选中它们")
+    return 0
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="从文档抽取结构化事实")
     parser.add_argument(
@@ -290,6 +371,19 @@ async def main() -> int:
         action="store_true",
         help="只重抽产出过撤回记录的文档（阶段 8 第 8 步的定向复核；无需再写 --reprocess）",
     )
+    parser.add_argument(
+        "--min-body-chars",
+        dest="min_body_chars",
+        type=int,
+        default=0,
+        help="只抽正文长度 >= N 的文档（默认 0 不限；批量跑建议 800，缺正文的等 enrich）",
+    )
+    parser.add_argument(
+        "--reset-no-body",
+        dest="reset_no_body",
+        action="store_true",
+        help="把「无正文却已被标记」的文档退回待抽取（配合 --dry-run 预演 / --apply 执行）",
+    )
     args = parser.parse_args()
     # 默认值要按模式分：普通增量跑 10 篇是保护预算；定向复核的候选集本来就只有十几篇，
     # 截到 10 篇等于「少复核了几条」而日志上看不出来。用 None 当哨兵才能区分
@@ -303,6 +397,15 @@ async def main() -> int:
     if problem:
         print(problem, file=sys.stderr)
         return 2
+
+    # 重置不需要模型：它的全部工作是一条 UPDATE。放在 require_llm 之前，
+    # 免得「LLM 配额用完了，连回滚都做不了」。
+    if args.reset_no_body:
+        if args.only_retracted:
+            print("--reset-no-body 与 --only-retracted 不能同时用", file=sys.stderr)
+            return 2
+        async with session_scope() as session:
+            return await reset_no_body(session, apply=args.apply)
 
     try:
         client = require_llm()
@@ -321,7 +424,8 @@ async def main() -> int:
         else:
             scope = "跳过已判定过的"
         limit_text = str(args.limit) if args.limit else "不限"
-        print(f"待处理文档 {len(documents)} 篇（limit={limit_text}，{scope}）")
+        body_text = f"正文≥{args.min_body_chars}字" if args.min_body_chars else "正文不限"
+        print(f"待处理文档 {len(documents)} 篇（limit={limit_text}，{scope}，{body_text}）")
 
         for index, document in enumerate(documents, start=1):
             stats.documents += 1
@@ -390,6 +494,9 @@ async def main() -> int:
                         print(f"[{index}] x 宾语形状不符（{reason}）：{discarded}")
                     else:
                         stats.malformed += 1
+                    if not reason.startswith("object_is_"):
+                        # 形状不符那个分支已经打印过了，别重复打两行
+                        print(format_drop(index, raw, reason))
                     continue
 
                 stats.facts += 1
@@ -459,7 +566,7 @@ async def main() -> int:
     # 全部抽取跑完、打印统计那一行才触发。
     print(
         "\n完成：文档 {documents} 篇，抽出 {facts} 条，入库 {written} 条，"
-        "重复 {duplicated} 条，谓词不合规 {rejected_predicate} 条，"
+        "重复 {duplicated} 条，谓词不在词表 {rejected_predicate} 条，"
         "自反 {rejected_reflexive} 条，宾语过长 {rejected_too_long} 条，"
         "宾语形状不符 {rejected_object_shape} 条，"
         "字段缺失 {malformed} 条，无事实 {empty_documents} 篇，"
@@ -480,7 +587,11 @@ async def main() -> int:
             f"格式 {stats.unparsed_format} 篇（prompt 或换模型）"
         )
     if stats.rejected_predicate:
-        print("谓词不合规说明模型在造词：先看是不是词表少了常用动作，别急着放宽校验")
+        print(
+            "谓词不在词表说明模型在造词：先看是不是词表少了常用动作，别急着放宽校验。"
+            "这一项只查谓词名，不查宾语是否符合该谓词的约定——"
+            "`funded` 的宾语填成投资方，谓词名是合法的，这里不会报"
+        )
     if stats.rejected_reflexive or stats.rejected_too_long:
         print(
             "自反/宾语过长被丢弃：说明 prompt 的规则 3、4 没被遵守。"

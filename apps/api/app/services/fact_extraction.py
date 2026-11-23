@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 
@@ -179,10 +180,31 @@ def _slice_between(text: str, open_char: str, close_char: str) -> str | None:
     return text[start : end + 1]
 
 
-def _compact(text: str) -> str:
-    """去掉所有空白。中文原文常被换行切断，逐字比对前必须先抹平。"""
+# NFKC 只统一宽度（`，`→`,`、`（`→`(`、全角字母数字→半角），不处理中文标点；
+# 下面这个集合补上 NFKC 不管的那些，两边一致地删掉，比对只剩字与字。
+_CJK_PUNCT = set("、。·「」『』《》〈〉【】〔〕—－…“”‘’")
 
-    return re.sub(r"\s+", "", text)
+# ASCII 标点。删掉它而不是映射成另一个符号：映射需要一张容易写漏的表，
+# 而「比字不比标点」本来就只需要删。
+_ASCII_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def _compact(text: str) -> str:
+    """只比字，不比空白、标点和全半角宽度。
+
+    中文新闻里全角半角混用极常见：原文写 `称,FSD V15`，模型抄成 `称，FSD V15`。
+    逐字比对会判成 `partial`，而 `partial` 的唯一用途是提示「模型改写了证据」——
+    假警报一多，这个信号就没人看了。实测就是这么误判的：
+    `特斯拉 --ceo--> 埃隆·马斯克`，证据与原文只差一个逗号的宽度。
+
+    代价是 `A,B` 与 `AB` 视为相同。证据比对要回答的是「这段话在不在原文里」，
+    不是「标点是否一致」，这个误差方向是安全的。
+    """
+
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(
+        ch for ch in text if not ch.isspace() and ch not in _CJK_PUNCT and ch not in _ASCII_PUNCT
+    )
 
 
 def evidence_match(evidence: str | None, source: str) -> str:
